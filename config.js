@@ -13,7 +13,7 @@
      Your Apps Script Web App URL. Apps Script editor:
         Deploy  ->  Manage deployments  ->  copy the Web app URL
      It must END IN /exec. A URL ending in /dev will not work from a browser. */
-  g.GYV_API_URL = 'https://script.google.com/macros/s/AKfycb.../exec';
+  g.GYV_API_URL = 'https://script.google.com/macros/s/AKfycby98MsTcBZ5SlFLqYKzj5y1mOY9CPeXIopivfdJ8Uh2mny5hjh1Yt3ies2QoWjLIQui/exec';
 
   /* ------------------------------------------------------------------ 2 of 2
      Build stamp. CHANGE THIS EVERY TIME YOU CHANGE ANY FILE.
