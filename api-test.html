@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GYV API connection test</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#EEF1EF;
+   color:#14201C;margin:0;padding:20px;line-height:1.5}
+ h1{font-size:18px;margin:0 0 4px} p.sub{color:#5C6B66;font-size:13px;margin:0 0 18px}
+ label{display:block;font-size:12px;font-weight:600;color:#5C6B66;margin:14px 0 5px}
+ input{width:100%;padding:11px 12px;border:1px solid #DCE2DE;border-radius:8px;
+   font-size:15px;box-sizing:border-box}
+ button{margin-top:14px;padding:11px 16px;border:0;border-radius:8px;background:#0F5C4A;
+   color:#fff;font-weight:600;font-size:14px;width:100%}
+ pre{margin-top:16px;background:#14201C;color:#3f6;padding:12px;border-radius:8px;
+   font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap;word-break:break-word;
+   max-height:52vh;overflow:auto}
+ .ok{color:#0F5C4A;font-weight:600} .bad{color:#A5322F;font-weight:600}
+</style></head><body>
+<h1>API connection test</h1>
+<p class="sub">Run this BEFORE moving the real app. It proves the /exec URL, the CORS
+path and the login all work, and it writes nothing.</p>
+
+<label>Apps Script /exec URL</label>
+<input id="u" placeholder="https://script.google.com/macros/s/AKfy.../exec">
+<label>Username (optional — leave blank to test ping only)</label>
+<input id="n" autocapitalize="none" spellcheck="false">
+<label>Password</label>
+<input id="p" type="password">
+<button id="go" type="button">Run test</button>
+<pre id="out">Ready.</pre>
+
+<script>
+var out=document.getElementById('out'), lines=[];
+function w(s,cls){ lines.push(s); out.innerHTML=lines.join('\n'); }
+function post(url,payload){
+  /* No Content-Type header on purpose: a plain string body sends text/plain,
+     which is CORS-safelisted, so no preflight is issued. Apps Script does not
+     answer preflights. */
+  return fetch(url,{method:'POST',body:JSON.stringify(payload),redirect:'follow'})
+    .then(function(r){ return r.text().then(function(t){ return {status:r.status,text:t}; }); });
+}
+document.getElementById('go').onclick=function(){
+  lines=[]; var url=document.getElementById('u').value.trim();
+  if(!url){ w('Paste the /exec URL first.'); return; }
+  if(url.slice(-5)!=='/exec') w('NOTE: URL does not end in /exec — that is usually wrong.');
+  w('1. POST ping ...');
+  post(url,{action:'ping'}).then(function(r){
+    w('   HTTP '+r.status);
+    var j=null; try{ j=JSON.parse(r.text); }catch(e){}
+    if(!j){
+      w('   FAIL — response was not JSON. First 300 chars:');
+      w('   '+r.text.slice(0,300));
+      w('');
+      w('   Almost always means the deployment is not "Who has access: Anyone".');
+      return;
+    }
+    w('   OK  build='+j.build+'  time='+j.time);
+    var n=document.getElementById('n').value.trim();
+    if(!n){ w(''); w('DONE. Connection and CORS are good. Fill in a username to test login.'); return; }
+    w('2. POST login ...');
+    return post(url,{action:'login',data:{username:n,password:document.getElementById('p').value}})
+      .then(function(r2){
+        var j2=null; try{ j2=JSON.parse(r2.text); }catch(e){}
+        if(!j2){ w('   FAIL — not JSON: '+r2.text.slice(0,200)); return; }
+        if(!j2.ok){ w('   login refused: '+(j2.error||'?')); return; }
+        w('   OK  token='+String(j2.token).slice(0,10)+'...  role='+j2.role+'  venue='+j2.venue);
+        w('3. POST getItems with that session ...');
+        return post(url,{action:'getItems',data:{},session:j2.token}).then(function(r3){
+          var j3=null; try{ j3=JSON.parse(r3.text); }catch(e){}
+          if(!j3){ w('   FAIL — not JSON'); return; }
+          w('   '+(j3.ok?('OK  items='+((j3.items||[]).length)):('FAIL '+j3.error)));
+          w('');
+          w(j3.ok?'ALL THREE PASSED. Safe to deploy the real app.'
+                 :'Login worked but the session call did not — send me this log.');
+        });
+      });
+  }).catch(function(e){
+    w('   NETWORK/CORS FAIL: '+((e&&e.message)||e));
+    w('');
+    w('   If this says "Failed to fetch", the usual causes are:');
+    w('     - deployment not set to Anyone');
+    w('     - the URL is the /dev URL instead of /exec');
+    w('     - a Content-Type header was added somewhere (triggers a preflight)');
+  });
+};
+</script></body></html>

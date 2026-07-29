@@ -1,0 +1,30 @@
+# Netlify header rules.
+#
+# The document and the service worker MUST NOT be cached by the CDN or the
+# browser. If they are, a deploy does not reach phones — which is the exact
+# problem that made us leave HtmlService. Everything else is content-addressed
+# enough to cache hard.
+
+/index.html
+  Cache-Control: no-cache, no-store, must-revalidate
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+
+/
+  Cache-Control: no-cache, no-store, must-revalidate
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+
+/service-worker.js
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/config.js
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/manifest.json
+  Cache-Control: no-cache
+
+/icons/*
+  Cache-Control: public, max-age=604800
