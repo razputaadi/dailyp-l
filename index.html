@@ -341,6 +341,10 @@
   .acitem{padding:11px 12px; font-size:14px; border-bottom:1px solid var(--line-2)}
   .acitem:last-child{border-bottom:none}
   .acitem.on{background:var(--accent-soft)}
+  /* Rejected free-text item. The field is cleared, so without a visible flash the
+     value just vanishes and looks like the app ate the typing. */
+  @keyframes acbad{0%,100%{background:#fff}35%{background:#FFE0E0}}
+  input.acbad{animation:acbad .5s ease-out 2; border-color:var(--bad,#A5322F)}
   #updbar{position:fixed; left:0; right:0; top:0; z-index:60; display:flex; align-items:center; justify-content:center; gap:12px;
     background:var(--accent); color:#fff; padding:8px 12px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,.2)}
   #updbar button{background:#fff; color:var(--accent-ink); border:none; border-radius:6px; padding:5px 12px; font-weight:600; cursor:pointer}
@@ -1316,7 +1320,7 @@ function revealRow(wrap, firstInput){
 
 function attachItemAC(input, dlId){ /* superseded by acUpgrade() */ }
 
-function acAttach(input, src){
+function acAttach(input, src, strict){
   var box=null, t=null, cur=-1, opts=[];
   /* A touch that lands on a row is not necessarily a choice — it is just as likely
      the start of a scroll to reach the row you actually want. The old handler
