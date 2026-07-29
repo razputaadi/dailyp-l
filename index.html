@@ -1448,11 +1448,58 @@ function acAttach(input, src, strict){
     open(out);
   }
   input.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(paint,120); });
+  /* STRICT FIELDS (item names only).
+     A typed name that is not in Item_Master cannot be allowed to reach the
+     archives: stock is allocated on PR_ID||item, so an unmatched name becomes a
+     purchase layer that no issue can ever consume, and a phantom balance that
+     survives every rebuild. Two things happen here.
+       1. CANONICALISE. An exact match ignoring case and collapsed whitespace is
+          rewritten to Item_Master's own spelling. This is what kills the "imli"
+          / "Imli" / "imli " family of drift at the point of entry rather than
+          reporting on it afterwards.
+       2. REJECT. Anything with no match is cleared and flashed.
+     Deliberately skipped when the source list is empty — that means the item
+     cache has not arrived yet, and punishing someone for the network being slow
+     would be indefensible. */
+  function acStrictCheck(){
+    var v=String(input.value||'').replace(/\s+/g,' ').trim();
+    var all=src()||[];
+    if(!all.length) return;                     // list not loaded — never punish
+    if(!v){ if(input.value!==''){ input.value=''; } return; }
+    var vk=v.toLowerCase(), canon=null;
+    for(var i=0;i<all.length;i++){
+      if(String(all[i]).replace(/\s+/g,' ').trim().toLowerCase()===vk){ canon=String(all[i]).trim(); break; }
+    }
+    if(canon){
+      if(input.value!==canon){
+        input.value=canon;
+        try{ input.dispatchEvent(new Event('input',{bubbles:true})); }catch(e){}
+        try{ input.dispatchEvent(new Event('change',{bubbles:true})); }catch(e){}
+      }
+      input.classList.remove('acbad');
+      return;
+    }
+    input.value='';
+    input.classList.add('acbad');
+    setTimeout(function(){ input.classList.remove('acbad'); }, 1100);
+    toast('\u201c'+v+'\u201d is not in Item Master \u2014 pick from the list.', true);
+    try{ input.dispatchEvent(new Event('input',{bubbles:true})); }catch(e){}
+    try{ input.dispatchEvent(new Event('change',{bubbles:true})); }catch(e){}
+  }
+  if(strict) input._acStrict=acStrictCheck;
+
   input.addEventListener('blur', function(){
     clearTimeout(t);
     /* Never close while a finger is down inside the list — that is a scroll, and
        closing it there is what would make the list impossible to browse. */
-    setTimeout(function(){ if(!interacting) close(); }, 80);
+    setTimeout(function(){
+      if(interacting) return;                   // still scrolling the list
+      close();
+      /* After close, not before: a tap on a row commits at pointerup and blur can
+         land first, so validating early would reject a value that is about to
+         become correct. */
+      if(strict) setTimeout(acStrictCheck, 220);
+    }, 80);
   });
   input.addEventListener('keydown', function(e){
     if(e.key==='Escape'){ close(); return; }
@@ -1483,19 +1530,54 @@ function acCloseAll(){
     if(b.parentNode) b.parentNode.removeChild(b);
   });
 }
+/* Which lists are CLOSED sets rather than suggestions. Keyed on the datalist id
+   because that is the one place every item field already declares itself, so
+   nothing in the twenty-odd form builders has to be touched.
+   Only the four that feed stock and the archives are here:
+     itemsDL    purchase lines
+     itemsDL2   issue lines
+     poItemsDL  purchase order lines
+     rqItemsDL  requirement lines
+   Deliberately ABSENT: rpItemList and rpCatList (report filters, where a partial
+   string is the whole point), vendors, and departments. Sales needs nothing —
+   its item field is readonly with a fixed value. */
+var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1 };
+
 function acUpgrade(){
   Array.prototype.forEach.call(document.querySelectorAll('input[list]'), function(inp){
     if(inp._acDone) return;
     inp._acDone=true;
     var id=inp.getAttribute('list');
     inp.removeAttribute('list');
+    var strict=!!AC_STRICT_LISTS[id];
     var dl=id?$(id):null;
     var statics = dl ? Array.prototype.map.call(dl.querySelectorAll('option'), function(o){ return o.value; }) : [];
-    if(statics.length) acAttach(inp, function(){ return statics; });
+    if(statics.length) acAttach(inp, function(){ return statics; }, strict);
     else acAttach(inp, function(){
       return (_itemsCache && _itemsCache.items || []).map(function(x){ return x.name; });
-    });
+    }, strict);
   });
+}
+
+/* Shared pre-submit gate. The blur handler clears a bad name, but blur never
+   fires if someone types and taps Submit directly, and on mobile that is the
+   common path rather than the rare one.
+   THIS FUNCTION IS A DEPENDENCY of submitPurchase, submitIssue and
+   collectDocLines. Its absence is a ReferenceError inside a click handler, which
+   surfaces nowhere and simply makes the button do nothing — so all three call
+   sites test for it before calling. */
+function acItemUnknown(el){
+  var v=String((el&&el.value)||'').replace(/\s+/g,' ').trim();
+  if(!v) return '';
+  var all=(_itemsCache && _itemsCache.items || []);
+  if(!all.length) return '';                   // cache not loaded — let the server judge
+  for(var i=0;i<all.length;i++){
+    if(String(all[i].name).replace(/\s+/g,' ').trim().toLowerCase()===v.toLowerCase()){
+      if(el.value!==String(all[i].name).trim()) el.value=String(all[i].name).trim();
+      return '';
+    }
+  }
+  return v;
 }
 
 function addPurchaseLine(){
@@ -1576,9 +1658,11 @@ function submitPurchase(){
   var date=$('pDate').value, vendor=$('pVendor').value.trim(), bill=$('pBill').value.trim(), notes=$('pNotes').value.trim();
   var msg=$('pMsg'); msg.className='msg err'; msg.textContent='';
   if(!date){ msg.textContent='Pick a date.'; return; }
-  var rows=[], bad=false, issueRows=[], splitBad=false;
+  var rows=[], bad=false, issueRows=[], splitBad=false, unknown=[];
   Array.prototype.forEach.call(document.querySelectorAll('#pLines .pline'), function(w){
-    var item=w.querySelector('.pItem').value.trim();
+    var iEl=w.querySelector('.pItem');
+    var u=(typeof acItemUnknown==='function')?acItemUnknown(iEl):''; if(u) unknown.push(u);
+    var item=iEl.value.trim();
     var qty=w.querySelector('.pQty').value, rate=w.querySelector('.pRate').value;
     if(!item && qty==='' && rate===''){ return; }             // fully empty line → skip
     if(!item || qty==='' || rate===''){ bad=true; return; }
@@ -1592,6 +1676,13 @@ function submitPurchase(){
       }});
     }
   });
+  /* Checked BEFORE the missing-field message, because a rejected name leaves the
+     field empty and "needs an item" would be a misleading way to describe it. */
+  if(unknown.length){
+    msg.textContent='Not in Item Master: '+unknown.join(', ')+
+      '. Pick from the list, or add it with "+ New item to master" first.';
+    return;
+  }
   if(bad){ msg.textContent='Each line needs item, qty and rate (or clear the line).'; return; }
   if(splitBad){ msg.textContent='A direct-issue total exceeds its purchased qty — fix it before submitting.'; return; }
   if(!rows.length){ msg.textContent='Add at least one item.'; return; }
@@ -1792,13 +1883,19 @@ function submitIssue(){
   var msg=$('iMsg'); msg.className='msg err'; msg.textContent='';
   if(!date){ msg.textContent='Pick a date.'; return; }
   if(!dept){ msg.textContent='Pick a department.'; return; }
-  var rows=[], bad=false;
+  var rows=[], bad=false, unknown=[];
   Array.prototype.forEach.call(document.querySelectorAll('#iLines .iline'), function(w){
-    var item=w.querySelector('.iItem').value.trim(), qty=w.querySelector('.iQty').value;
+    var iEl=w.querySelector('.iItem');
+    var u=(typeof acItemUnknown==='function')?acItemUnknown(iEl):''; if(u) unknown.push(u);
+    var item=iEl.value.trim(), qty=w.querySelector('.iQty').value;
     if(!item && qty===''){ return; }                          // fully empty line → skip
     if(!item || qty===''){ bad=true; return; }
     rows.push([date, req, item, qty, dept, by1, by2, notes]);
   });
+  if(unknown.length){
+    msg.textContent='Not in Item Master: '+unknown.join(', ')+'. Pick from the list.';
+    return;
+  }
   if(bad){ msg.textContent='Each line needs an item and qty (or clear the line).'; return; }
   if(!rows.length){ msg.textContent='Add at least one item.'; return; }
   var label = dept + (req?(' · '+req):'');
@@ -3304,7 +3401,11 @@ function collectDocLines(hostId){
        unguarded: the blur handler clears a bad name, but typing one and tapping
        Raise requirement without leaving the field never fires blur — and on a
        phone that is the normal way to submit, not the exception. */
-    var u=acItemUnknown(el); if(u) unknown.push(u);
+    /* Guarded on purpose. If acItemUnknown were ever missing, an unguarded call
+       here throws ReferenceError inside a click handler — which surfaces
+       nowhere and just makes Raise requirement do nothing at all. A validation
+       convenience must never be able to stop a save. */
+    var u=(typeof acItemUnknown==='function')?acItemUnknown(el):''; if(u) unknown.push(u);
     var it=el.value.trim(), q=w.querySelector('.dQty').value;
     if(!it && q===''){ return; }
     if(!it || q===''){ bad=true; return; }
