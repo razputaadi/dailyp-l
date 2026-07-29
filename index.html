@@ -341,6 +341,13 @@
   .acitem{padding:11px 12px; font-size:14px; border-bottom:1px solid var(--line-2)}
   .acitem:last-child{border-bottom:none}
   .acitem.on{background:var(--accent-soft)}
+  /* Two-part row: the name, and the unit it is counted in. The unit is presentation
+     only — the value committed to the field comes from data-v, never from the row
+     text — so it can never end up inside an item name. */
+  .acitem{display:flex; align-items:baseline; gap:8px}
+  .acitem .acnm{flex:1; min-width:0}
+  .acitem .acuom{flex:none; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--muted); background:var(--accent-soft); border-radius:4px; padding:2px 6px}
   /* Rejected free-text item. The field is cleared, so without a visible flash the
      value just vanishes and looks like the app ate the typing. */
   @keyframes acbad{0%,100%{background:#fff}35%{background:#FFE0E0}}
@@ -1039,12 +1046,27 @@ function pePaintGroupCounts(ed){
 
 /* ---------------- Purchases entry ---------------- */
 var _itemsCache=null;   // { items:[{name,category,uom}], vendors:[...] }
+/* name -> uom, built once per item cache. Rebuilt lazily rather than eagerly so a
+   cache refresh only costs anything if a list is actually opened afterwards.
+   MUST be nulled wherever _itemsCache is replaced, or a newly added item shows a
+   stale unit. */
+var _uomIdx=null;
+function acUomOf(name){
+  if(!_uomIdx){
+    _uomIdx={};
+    (_itemsCache && _itemsCache.items || []).forEach(function(x){
+      _uomIdx[String(x.name).replace(/\s+/g,' ').trim().toLowerCase()]=String(x.uom||'').trim();
+    });
+  }
+  return _uomIdx[String(name).replace(/\s+/g,' ').trim().toLowerCase()]||'';
+}
 function ensureItems(cb){
   if(_itemsCache){ cb(); return; }
   api('getItems').then(function(res){
     _itemsCache = (res&&res.ok) ? {items:res.items||[], vendors:res.vendors||[], departments:res.departments||[]} : {items:[], vendors:[], departments:[]};
+    _uomIdx=null;
     cb();
-  }).catch(function(){ _itemsCache={items:[], vendors:[]}; cb(); });
+  }).catch(function(){ _itemsCache={items:[], vendors:[]}; _uomIdx=null; cb(); });
 }
 function todayStr(){
   var d=new Date(), mm=('0'+(d.getMonth()+1)).slice(-2), dd=('0'+d.getDate()).slice(-2);
@@ -1363,8 +1385,22 @@ function acAttach(input, src, strict){
     box.style.left=(r.left+window.pageXOffset)+'px';
     box.style.top=(r.bottom+window.pageYOffset+2)+'px';
     box.style.width=Math.max(r.width,160)+'px';
-    list.forEach(function(v){
-      var d=document.createElement('div'); d.className='acitem'; d.textContent=v;
+   list.forEach(function(v){
+      var d=document.createElement('div'); d.className='acitem';
+      /* THE VALUE LIVES IN data-v, NOT IN THE TEXT. commit() used to read
+         row.textContent, so the moment anything else was rendered inside a row
+         — a unit, a category, a price hint — it would have been appended
+         straight into the item name and written to the archive under a name that
+         matches nothing. Keep these two facts together. */
+      d.setAttribute('data-v', v);
+      var u=acUomOf(v);
+      if(u){
+        var nm=document.createElement('span'); nm.className='acnm'; nm.textContent=v;
+        var uo=document.createElement('span'); uo.className='acuom'; uo.textContent=u;
+        d.appendChild(nm); d.appendChild(uo);
+      } else {
+        d.textContent=v;
+      }
       box.appendChild(d);
     });
     /* Selection is decided on pointerUP, once the gesture's shape is known. A
@@ -1382,9 +1418,10 @@ function acAttach(input, src, strict){
       if(box.scrollTop !== g.scroll) return;                                 // the list scrolled
       if(Math.abs(e.clientY-g.y)>10 || Math.abs(e.clientX-g.x)>10) return;   // a drag
       if(Date.now()-g.t>700) return;                                         // a long press
-      if(rowOf(e.target) !== g.row) return;                                  // moved off the row
+     if(rowOf(e.target) !== g.row) return;                                  // moved off the row
       e.preventDefault();
-      commit(g.row.textContent);
+      /* data-v, never textContent — see the note in open(). */
+      commit(g.row.getAttribute('data-v'));
     });
     box.addEventListener('pointercancel', function(){ interacting=false; gest=null; });
     /* Focus retention WITHOUT blocking the scroll — this is the pairing the v18
@@ -1481,7 +1518,12 @@ function addPurchaseLine(){
   function onAmt(){ var qn=parseFloat(q.value)||0; if(qn>0 && amt.value!==''){ setRate((parseFloat(amt.value)||0)/qn); } recalcTotal(); }
   q.oninput=onQty; r.oninput=onRate; amt.oninput=onAmt;
   del.onclick=function(){ wrap.parentNode.removeChild(wrap); recalcTotal(); };
-  it.onchange=function(){ showLastRate(it, wrap); };
+ it.onchange=function(){
+    showLastRate(it, wrap);
+    /* The unit belongs where the number is typed. No layout change: the qty
+       placeholder is already there and already empty. */
+    var u=acUomOf(it.value); q.placeholder=u?('Qty in '+u):'0';
+  };
   attachItemAC(it, 'itemsDL');
   iss.onclick=function(){ openIssueModal(wrap); };
   revealRow(wrap, it);
@@ -1737,6 +1779,10 @@ function addIssueLine(){
     '<button class="pDel" title="Remove line" type="button">\u00d7</button>';
   $('iLines').appendChild(wrap);
   attachItemAC(wrap.querySelector('.iItem'), 'itemsDL2');
+  (function(){
+    var iIt=wrap.querySelector('.iItem'), iQ=wrap.querySelector('.iQty');
+    iIt.onchange=function(){ var u=acUomOf(iIt.value); iQ.placeholder=u?('Qty in '+u):'0'; };
+  })();
   wrap.querySelector('.pDel').onclick=function(){ wrap.parentNode.removeChild(wrap); };
   revealRow(wrap, wrap.querySelector('.iItem'));
 }
@@ -3251,14 +3297,20 @@ function addDocLine(hostId, dlId, phQty){
   revealRow(wrap, it);
 }
 function collectDocLines(hostId){
-  var rows=[], bad=false;
+  var rows=[], bad=false, unknown=[];
   Array.prototype.forEach.call(document.querySelectorAll('#'+hostId+' .docline'), function(w){
-    var it=w.querySelector('.dItem').value.trim(), q=w.querySelector('.dQty').value;
+    var el=w.querySelector('.dItem');
+    /* Requirement and Purchase Order both come through here, and both were left
+       unguarded: the blur handler clears a bad name, but typing one and tapping
+       Raise requirement without leaving the field never fires blur — and on a
+       phone that is the normal way to submit, not the exception. */
+    var u=acItemUnknown(el); if(u) unknown.push(u);
+    var it=el.value.trim(), q=w.querySelector('.dQty').value;
     if(!it && q===''){ return; }
     if(!it || q===''){ bad=true; return; }
     rows.push([it, q]);
   });
-  return { rows:rows, bad:bad };
+  return { rows:rows, bad:bad, unknown:unknown };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3427,6 +3479,14 @@ function submitPO(){
   if(!date){ msg.textContent='Pick a PO date.'; return; }
   if(!vendor){ msg.textContent='Choose a vendor.'; return; }
   var got=collectDocLines('oLines');
+  if(got.unknown && got.unknown.length){
+    var _om=$('oMsg');
+    if(_om){ _om.className='msg err';
+      _om.textContent='Not in Item Master: '+got.unknown.join(', ')+
+        '. Pick from the list, or add it with "+ New item to master" first.'; }
+    else toast('Not in Item Master: '+got.unknown.join(', '), true);
+    return;
+  }
   if(got.bad){ msg.textContent='Each line needs an item and a qty (or clear the line).'; return; }
   if(!got.rows.length){ msg.textContent='Add at least one item.'; return; }
   var editing=_editPoId;
@@ -3906,6 +3966,14 @@ function submitRequirement(){
   if(!date){ msg.textContent='Pick a date.'; return; }
   if(!dept){ msg.textContent='Choose a department.'; return; }
   var got=collectDocLines('qLines');
+  if(got.unknown && got.unknown.length){
+    var _qm=$('qMsg');
+    if(_qm){ _qm.className='msg err';
+      _qm.textContent='Not in Item Master: '+got.unknown.join(', ')+
+        '. Pick from the list, or add it with "+ New item to master" first.'; }
+    else toast('Not in Item Master: '+got.unknown.join(', '), true);
+    return;
+  }
   if(got.bad){ msg.textContent='Each line needs an item and a qty (or clear the line).'; return; }
   if(!got.rows.length){ msg.textContent='Add at least one item.'; return; }
   var editing=_editReqId;
