@@ -5,14 +5,23 @@
 # problem that made us leave HtmlService. Everything else is content-addressed
 # enough to cache hard.
 
+# no-cache, NOT no-store. The two are often confused and the difference is the
+# whole point here:
+#   no-store  = the browser may not keep a copy at all, so all 235KB of the app
+#               is downloaded again on every single launch.
+#   no-cache  = the browser may keep a copy but must ASK before using it. If the
+#               file has not changed it gets a 304 and reuses what it has.
+# The freshness guarantee is identical — nothing stale can ever be used without
+# checking — but an unchanged deploy now costs one small request instead of
+# 235KB. This does not weaken the reason we left HtmlService.
 /index.html
-  Cache-Control: no-cache, no-store, must-revalidate
+  Cache-Control: no-cache, must-revalidate
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
 
 /
-  Cache-Control: no-cache, no-store, must-revalidate
+  Cache-Control: no-cache, must-revalidate
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
