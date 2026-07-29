@@ -34,9 +34,18 @@
 <meta http-equiv="Expires" content="0">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<!-- Non-blocking. media="print" lets the browser fetch this at low priority
+     without holding up first paint; onload flips it to all and it applies. Both
+     --ui and --display fall back to system-ui, so the second before it lands
+     looks ordinary rather than broken. -->
+<link rel="stylesheet" media="print" onload="this.media='all';this.onload=null" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap"></noscript>
+
+<!-- html2canvas (~200KB) and jsPDF (~360KB) USED TO LOAD HERE: blocking, in the
+     head, on every single launch — for two buttons on one tab that most shifts
+     never touch. They are now fetched on first export by _libLoad(), below. If
+     you ever move them back up here, know that you are paying ~550KB of download
+     and parse before first paint to do it. -->
 
 <style>
   :root{
@@ -575,7 +584,14 @@ function doLogin(){
 }
 function bootstrap(){
   return api('bootstrap').then(function(res){
-    if(!res.ok){ throw new Error(res.error||'Bootstrap failed'); }
+    if(!res.ok){
+      /* The one distinction that matters at boot: did the SERVER refuse this
+         session, or did the request simply never get an answer? Only the first
+         should ever throw the stored token away. */
+      var be=new Error(res.error||'Bootstrap failed');
+      if(/session|log in again/i.test(String(res.error||''))) be.authFail=true;
+      throw be;
+    }
     state.me=res;
     if(res.venueNames){ for(var k in res.venueNames){ _venueNames[k]=res.venueNames[k]; } }
     renderApp();
@@ -2403,9 +2419,39 @@ function rpMergeCompare(base, cmp){
   return rpMergeOne(base.headers, base.rows, cmp.headers, cmp.rows);
 }
 function rpFileName(ext){ return (_rpLabel||'report').replace(/[^a-z0-9]+/gi,'_').replace(/^_|_$/g,'')+'_'+todayStr()+'.'+ext; }
+/* Loads a script once, on demand, and keeps the promise so a second export does
+   not fetch it again. Cross-origin, so the service worker's fetch handler bails
+   out of it entirely and the CDN's own cache headers apply. */
+var _libP={};
+function _libLoad(url, ready){
+  if(ready()) return Promise.resolve();
+  if(_libP[url]) return _libP[url];
+  _libP[url]=new Promise(function(res,rej){
+    var sc=document.createElement('script');
+    sc.src=url; sc.async=true;
+    sc.onload=function(){ if(ready()) res(); else rej(new Error('Export tool loaded but is not usable.')); };
+    sc.onerror=function(){ _libP[url]=null; rej(new Error('Could not download the export tool. Check the connection.')); };
+    document.head.appendChild(sc);
+  });
+  return _libP[url];
+}
+function _libExport(){
+  return _libLoad('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+                  function(){ return typeof html2canvas==='function'; })
+    .then(function(){
+      return _libLoad('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+                      function(){ return !!((window.jspdf&&window.jspdf.jsPDF)||window.jsPDF); });
+    });
+}
 function rpCapture(cb){
   var node=$('rpBody'); if(!node){ return; }
-  if(typeof html2canvas!=='function'){ toast('Export tools still loading — try again in a moment', true); return; }
+  /* The first export of a session pays the download; every one after it is
+     instant. This is the whole cost of taking 550KB off the boot path. */
+  toast('Preparing export\u2026');
+  _libExport().then(function(){ _rpCaptureNow(node, cb); })
+              .catch(function(e){ toast((e&&e.message)||'Export tools failed to load', true); });
+}
+function _rpCaptureNow(node, cb){
   var wraps=node.querySelectorAll('.matrix-wrap'), saved=[];
   Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
   html2canvas(node, {scale:2, backgroundColor:'#ffffff', windowWidth: node.scrollWidth+40}).then(function(c){
@@ -2840,15 +2886,71 @@ $('p').addEventListener('keydown', function(e){ if(e.key==='Enter') doLogin(); }
 $('u').addEventListener('keydown', function(e){ if(e.key==='Enter') $('p').focus(); });
 
 // preload venue display names (best-effort; also refreshed after login via listVenues)
+/* ── Boot ──────────────────────────────────────────────────────────────────
+   Two different faults were indistinguishable to whoever was holding the phone,
+   and both of them read as "it logged me out":
+
+     1. #login is visible in the markup and #app is hidden, so for the whole time
+        bootstrap was in flight — 2 to 5 seconds against an Apps Script cold
+        start — the SIGN IN CARD was what you were looking at. Nothing was
+        wrong. It simply looked exactly like being signed out, every launch.
+     2. The old catch cleared the token on ANY rejection. call() rejects on
+        "Failed to fetch", on HTTP 500, on the 180s timeout, and on a non-JSON
+        reply. So one weak-signal moment at launch destroyed a valid session and
+        made someone type their password again for no reason at all.
+
+   Now a stored token hides the login card immediately and shows a restoring
+   screen. A REFUSAL from the server signs you out. A failure to REACH the server
+   does not — it retries, then offers a button, and the token stays saved. */
 (function init(){
   var t=loadSession();
-  if(t){
-    state.session=t;
-    bootstrap().catch(function(){ // token dead / expired → show login
-      state.session=null; saveSession('');
-      $('app').classList.add('hidden'); $('login').classList.remove('hidden');
+  if(!t) return;
+  state.session=t;
+
+  var sp=document.createElement('div');
+  sp.id='bootSplash';
+  sp.style.cssText='position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;'+
+    'align-items:center;justify-content:center;gap:14px;background:var(--bg,#EEF1EF);'+
+    'font:15px/1.5 var(--ui,system-ui);color:var(--ink,#14201C);text-align:center;padding:24px';
+  sp.innerHTML='<div style="font-family:var(--display,system-ui);font-weight:700;font-size:22px">'+
+    'GYV <span style="opacity:.45">\u00b7</span> Ambria</div>'+
+    '<div id="bootMsg" style="opacity:.65;font-size:13px">Restoring session\u2026</div>'+
+    '<div id="bootAct"></div>';
+  document.body.appendChild(sp);
+  $('login').classList.add('hidden');
+
+  function done(){ if(sp.parentNode) sp.parentNode.removeChild(sp); }
+  function toLogin(why){
+    done();
+    state.session=null; saveSession('');
+    $('app').classList.add('hidden'); $('login').classList.remove('hidden');
+    if(why) $('loginMsg').textContent=why;
+  }
+  /* Three tries, widening. Absorbs a cold start and a lift-tunnel moment without
+     making a genuine outage take a minute to report. */
+  var waits=[0, 2500, 6000], n=0;
+  function attempt(){
+    bootstrap().then(done).catch(function(e){
+      if(e && e.authFail){ toLogin('Your session expired. Please sign in again.'); return; }
+      n++;
+      if(n<waits.length){
+        $('bootMsg').textContent='Server not responding \u2014 retrying\u2026 ('+n+'/'+(waits.length-1)+')';
+        setTimeout(attempt, waits[n]);
+        return;
+      }
+      /* Out of retries. As far as we know the token is still perfectly good, so
+         it stays saved and nobody is sent to the login screen over a bad signal. */
+      $('bootMsg').textContent='Could not reach the server. Your sign-in is still saved.';
+      $('bootAct').innerHTML='<button class="btn" id="bootRetry" style="min-width:170px">Try again</button>'+
+        '<div style="margin-top:12px"><a href="#" id="bootSignout" '+
+        'style="font-size:12px;opacity:.55;color:inherit">Sign in as someone else</a></div>';
+      $('bootRetry').onclick=function(){
+        n=0; $('bootAct').innerHTML=''; $('bootMsg').textContent='Restoring session\u2026'; attempt();
+      };
+      $('bootSignout').onclick=function(ev){ ev.preventDefault(); toLogin(''); };
     });
   }
+  attempt();
 })();
 
 checkVersion();
