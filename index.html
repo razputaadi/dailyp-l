@@ -2683,6 +2683,248 @@ function rpPnlStatement(t){
   return r;
 }
 function rpTableFromPnL(res){ return { headers:['Line','Amount'], rows:rpPnlStatement(res) }; }
+/* ══ SUMMARY P&L — MANAGEMENT FORMAT ═══════════════════════════════
+   Renders getPnLPack into the fifteen sections of the printed management pack,
+   in the same order, so the on-screen report and the circulated PDF are the same
+   document. Every figure comes from the server payload; the only arithmetic done
+   here is the break-even block, because its target % is a report input and doing
+   it locally lets the target be changed without another archive read.
+   ═══════════════════════════════════════════════════════════ */
+var _rpBeTarget = 35;      // break-even target consumption %, from the report input
+
+function rpP(v){ return (typeof v==='number' && isFinite(v)) ? ((v*100).toFixed(2)+'%') : '\u2014'; }
+function rpNum(v){ return rpN2(typeof v==='number' ? v : 0); }
+
+/* Rows for a Particulars / Amount / % of Net Sales block. pct is computed here
+   rather than server-side so a zero-sales period shows a dash instead of a
+   division artefact. */
+function rpPnlRows(ns, list){
+  return list.map(function(x){
+    var amt=x[1]||0;
+    return [x[0], rpNum(amt), (ns>0 ? rpP(amt/ns) : '\u2014')];
+  });
+}
+
+function rpTableFromPnLPack(res){
+  var P=res.period||{}, inc=P.income||{}, dir=P.direct||{}, ind=P.indirect||{},
+      k=P.kpi||{}, memo=P.memo||{}, be=P.beBase||{};
+  var ns=inc.netSales||0;
+  var S=[];
+
+  S.push({ title:'PERIOD AT A GLANCE', headers:['Measure','Value'], rows:[
+    ['Net Sales', rpNum(ns)],
+    ['Gross Profit / (Loss)', rpNum(P.grossProfit)],
+    ['Net Profit / (Loss)', rpNum(P.netProfit)],
+    ['Net Profit Margin', rpP(P.netProfitMargin)],
+    ['Days in period', P.days||0]
+  ]});
+
+  S.push({ title:'A. INCOME', headers:['Particulars','Amount (Rs.)','% of Net Sales'],
+    rows: rpPnlRows(ns, [
+      ['Gross Sale (all order types)', inc.grossSale],
+      ['Less: GST on Sales', inc.gstOnSales],
+      ['NET SALES', ns],
+      ['Add: Complimentary Income (billed at 0%)', inc.compIncome],
+      ['Add: Staff Food Income', inc.staffFoodIncome],
+      ['Add: Returns (added back)', inc.returnsAddBack],
+      ['TOTAL NET INCOME (A)', inc.totalNetIncome]
+    ])});
+
+  /* DE-typed expense heads are itemised individually. They belong above gross
+     profit, and if any exist the total will not match the old cockpit figure —
+     that is the correction, not a discrepancy. */
+  var bLines=[
+    ['Consumption — Food, Beverage & Stores', dir.consumption],
+    ['Zomato Commission', dir.zomatoComm],
+    ['Swiggy Commission', dir.swiggyComm],
+    ['Zomato GST', dir.zomatoGST],
+    ['Swiggy GST', dir.swiggyGST],
+    ['Zomato Advertisement', dir.zomatoAds],
+    ['Swiggy Advertisement', dir.swiggyAds]
+  ];
+  (dir.deHeads||[]).forEach(function(h){ bLines.push(['Direct expense — '+h.head, h.amount]); });
+  bLines.push(['TOTAL DIRECT EXPENSES (B)', dir.total]);
+  S.push({ title:'B. DIRECT EXPENSES (variable cost of sales)',
+    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, bLines) });
+
+  S.push({ title:'GROSS PROFIT (A - B)', headers:['Measure','Value'], rows:[
+    ['Consumption % of Net Sales', rpP(dir.consPctNetSales)],
+    ['GROSS PROFIT (A - B)', rpNum(P.grossProfit)],
+    ['Gross Profit Margin (on Net Sales)', rpP(P.grossProfitPct)]
+  ]});
+
+  var cLines=[['Fixed Expenses', ind.fixed]];
+  (ind.otherHeads||[]).forEach(function(h){ cLines.push(['Other — '+h.head, h.amount]); });
+  cLines.push(['Other Expenses (total)', ind.other]);
+  cLines.push(['TOTAL INDIRECT EXPENSES (C)', ind.total]);
+  S.push({ title:'C. INDIRECT EXPENSES (fixed / period costs)',
+    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, cLines) });
+
+  S.push({ title:'NET PROFIT / (LOSS) (A - B - C)', headers:['Measure','Value'], rows:[
+    ['NET PROFIT / (LOSS)', rpNum(P.netProfit)],
+    ['Net Profit Margin (on Net Sales)', rpP(P.netProfitMargin)]
+  ]});
+
+  S.push({ title:'KEY PERFORMANCE INDICATORS', headers:['Indicator','Value'], rows:[
+    ['Gross Sale per Day', rpNum(k.grossSalePerDay)],
+    ['Net Sales per Day', rpNum(k.netSalesPerDay)],
+    ['Consumption % of Net Sales', rpP(k.consPct)],
+    ['Direct Expense % of Net Sales', rpP(k.directPct)],
+    ['Fixed Expense per Day', rpNum(k.fixedPerDay)],
+    ['Fixed Expense % of Net Sales', rpP(k.fixedPct)],
+    ['Aggregator Sale (Zomato + Swiggy, gross)', rpNum(k.aggSale)],
+    ['Aggregator Cost (commission + GST + ads)', rpNum(k.aggCost)],
+    ['Aggregator Cost % of Aggregator Sale', rpP(k.aggCostPctAggSale)],
+    ['Discount % of Gross Sale', rpP(k.discountPctGross)],
+    ['Complimentary Sale % of Net Sales', rpP(k.compPctNetSales)],
+    ['Contribution per Rs. 1 of Net Sales', rpNum(k.contributionPerRupee)]
+  ]});
+
+  /* BREAK-EVEN. Deliberately reports impossibility rather than printing a
+     meaningless number: once target cost plus actual aggregator cost reaches
+     100% of net sales the contribution margin is nil or negative, and every
+     additional rupee of sale increases the loss. Dividing by that would produce
+     a confident-looking figure with no meaning. */
+  var tgt=(parseFloat(_rpBeTarget)||0)/100;
+  var odp=be.otherDirectPct||0, cm=1-tgt-odp;
+  var fpo=be.fixedPlusOther||0, days=be.days||1;
+  var cmAct=1-(dir.consPctNetSales||0)-odp;
+  var beRows=[
+    ['Target Consumption % of Net Sales (assumption)', rpP(tgt)],
+    ['Actual Consumption % of Net Sales', rpP(dir.consPctNetSales)],
+    ['Aggregator & other direct cost % of Net Sales (actual)', rpP(odp)],
+    ['Contribution Margin % at target cost structure', rpP(cm)],
+    /* The margin at ACTUAL cost, not just at target. This is the line that tells
+       you whether selling more currently helps or hurts \u2014 the single most
+       important number on the page, and the one a target-only block hides. */
+    ['Contribution Margin % at ACTUAL cost structure', rpP(cmAct)],
+    ['Fixed + Other expenses as % of Net Sales', rpP(ns>0?(fpo/ns):0)]
+  ];
+  if(cmAct<=0){
+    beRows.push(['\u26a0 At actual cost',
+      'Contribution margin is nil or negative, so every additional rupee of sale increases the loss. Volume alone cannot fix this \u2014 cost % must come down too.']);
+  }
+  if(ns>0 && fpo>ns){
+    beRows.push(['\u26a0 Fixed cost',
+      'Fixed and other period costs alone exceed Net Sales, so break-even is unattainable at this volume even at zero food cost.']);
+  }
+  if(cm>0){
+    var beSales=fpo/cm;
+    beRows.push(['Break-even Net Sales required for the period', rpNum(beSales)]);
+    beRows.push(['Break-even Net Sales required per Day', rpNum(beSales/days)]);
+    beRows.push(['Gap vs. Actual Net Sales (shortfall)', rpNum(beSales-ns)]);
+    beRows.push(['Times current Net Sales needed to break even', ns>0?rpN2(beSales/ns):'\u2014']);
+  } else {
+    beRows.push(['Break-even Net Sales required for the period','Not attainable']);
+    beRows.push(['Why','Contribution margin is nil or negative at this cost structure — every additional rupee of sale increases the loss. Cost % and volume must move together.']);
+  }
+  S.push({ title:'BREAK-EVEN ANALYSIS (change the target % above and re-run)',
+    headers:['Particulars','Amount / %'], rows:beRows });
+
+  S.push({ title:'MEMO / INFORMATION ITEMS (not charged to the P&L above)',
+    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, [
+      ['Discount Given', memo.discount],
+      ['Complimentary Sale (net value given free)', memo.compSale],
+      ['Cancelled Sale', memo.cancelledSale],
+      ['Spoilage Value', memo.spoilage]
+    ])});
+
+  // ── Annexures ──
+  var gs=inc.grossSale||0;
+  var a1=(res.a1||[]).map(function(r){ return [r.orderType, rpNum(r.amount), gs>0?rpP(r.amount/gs):'\u2014']; });
+  a1.push(['Total Gross Sale', rpNum(gs), gs>0?'100.00%':'\u2014']);
+  S.push({ title:'ANNEXURE 1 | SALES BY ORDER TYPE (gross)',
+    headers:['Order Type','Amount (Rs.)','% of Gross Sale'], rows:a1 });
+
+  var ct=0; (res.a2||[]).forEach(function(r){ ct+=r.amount||0; });
+  var a2=(res.a2||[]).map(function(r){ return [r.mode, rpNum(r.amount), gs>0?rpP(r.amount/gs):'\u2014']; });
+  a2.push(['Total Collection', rpNum(ct), gs>0?rpP(ct/gs):'\u2014']);
+  S.push({ title:'ANNEXURE 2 | SALES BY PAYMENT MODE (gross)',
+    headers:['Payment Mode','Amount (Rs.)','% of Gross Sale'], rows:a2 });
+
+  var t3=[0,0,0,0];
+  var a3=(res.a3||[]).map(function(r){
+    t3[0]+=r.revenue||0; t3[1]+=r.consumption||0; t3[2]+=r.ret||0; t3[3]+=r.grossProfit||0;
+    return [r.dept, rpNum(r.revenue), rpNum(r.consumption), rpNum(r.ret), rpNum(r.grossProfit)]; });
+  a3.push(['Total', rpNum(t3[0]), rpNum(t3[1]), rpNum(t3[2]), rpNum(t3[3])]);
+  S.push({ title:'ANNEXURE 3 | DEPARTMENT-WISE GROSS PROFIT',
+    headers:['Department','Revenue (Rs.)','Consumption (Rs.)','Return (Rs.)','Gross Profit (Rs.)'], rows:a3 });
+
+  var tot4=0; (res.a4||[]).forEach(function(r){ tot4+=r.net||0; });
+  var a4=(res.a4||[]).map(function(r){
+    return [r.category, rpNum(r.iss), rpNum(r.ret), rpNum(r.spo), rpNum(r.net),
+            tot4>0?rpP(r.net/tot4):'\u2014']; });
+  a4.push(['Total', '', '', '', rpNum(tot4), tot4>0?'100.00%':'\u2014']);
+  S.push({ title:'ANNEXURE 4 | CONSUMPTION BY CATEGORY',
+    headers:['Category','Issue (Rs.)','Return (Rs.)','Spoilage (Rs.)','Net Consumption (Rs.)','% of Total'], rows:a4 });
+
+  /* A tolerance of one rupee, not zero: FIFO rates carry more decimal places
+     than the archive stores, so an exact-zero test would flag healthy periods. */
+  S.push({ title:'ANNEXURE 5 | RECONCILIATION CHECKS (auto-calculated)',
+    headers:['Check','Difference (Rs.)','Status'],
+    rows:(res.a5||[]).map(function(r){
+      return [r.check, rpNum(r.diff), (Math.abs(r.diff||0)<1 ? 'OK' : 'INVESTIGATE')]; })});
+
+  S.push({ title:'ANNEXURE 6 | BRIDGE — DEPARTMENT GROSS PROFIT TO P&L GROSS PROFIT',
+    headers:['Particulars','Amount (Rs.)'],
+    rows:(res.a6||[]).map(function(r){ return [r.particular, rpNum(r.amount)]; })});
+
+  return { sections:S };
+}
+
+function rpTableFromFoodCost(res){
+  var P=res.period||{}, f=P.food||{};
+  return { sections:[
+    { title:'FOOD COST', headers:['Particulars','Amount (Rs.)'], rows:[
+      ['Food Net Sales (excl. Beverages)', rpNum(f.netSales)],
+      ['Income From Comp Sales (Food)', rpNum(f.compIncome)],
+      ['Income From Staff Food', rpNum(f.staffFoodIncome)],
+      ['Total Sales', rpNum(f.totalSales)],
+      ['Food Cost', rpNum(f.cost)],
+      ['Food Cost %', rpP(f.costPct)]
+    ]},
+    { title:'CONTEXT', headers:['Measure','Value'], rows:[
+      ['Net Sales (all)', rpNum((P.income||{}).netSales)],
+      ['Food Cost % of total Net Sales', rpP(((P.income||{}).netSales>0)?(f.cost/(P.income||{}).netSales):0)],
+      ['Days in period', P.days||0],
+      ['Food Cost per Day', rpNum((f.cost||0)/(P.days||1))]
+    ]},
+    /* Printed so the number is auditable. A cost report whose definition is
+       invisible is a number nobody can check or challenge. */
+    { title:'DEFINITION — what is counted', headers:['Basis','Included'], rows:[
+      ['Departments (issue destination)', (res.depts||[]).join(', ')],
+      ['Item categories', (res.cats||[]).join(', ')],
+      ['Note','Spelling variants are listed deliberately: category matching is exact, so an unmerged duplicate in Item_Master would otherwise be dropped from cost.']
+    ]}
+  ]};
+}
+
+function rpTableFromBevCost(res){
+  var P=res.period||{}, b=P.bev||{};
+  return { sections:[
+    { title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
+      ['Beverages Sales (net)', rpNum(b.netSales)],
+      ['Comp. Beverage Sale', rpNum(b.compIncome)],
+      ['Total Beverage Sales', rpNum(b.totalSales)],
+      ['Cost of Beverages', rpNum(b.cost)],
+      ['Beverage Cost %', rpP(b.costPct)]
+    ]},
+    { title:'CONTEXT', headers:['Measure','Value'], rows:[
+      ['Net Sales (all)', rpNum((P.income||{}).netSales)],
+      ['Beverage share of Net Sales', rpP(((P.income||{}).netSales>0)?(b.netSales/(P.income||{}).netSales):0)],
+      ['Days in period', P.days||0],
+      ['Beverage Cost per Day', rpNum((b.cost||0)/(P.days||1))]
+    ]},
+    /* This caveat is the whole reason the number looks low. Stated on the report
+       itself, not buried in a handover doc. */
+    { title:'DEFINITION — read this before using the %', headers:['Basis','Included'], rows:[
+      ['Scope', res.note||''],
+      ['Departments (issue destination)', (res.depts||[]).join(', ')],
+      ['Item categories', (res.cats||[]).join(', ')]
+    ]}
+  ]};
+}
+
 function rpTableFromFullPnL(res){
   var sections=[{ title:'P&L Statement', headers:['Line','Amount'], rows:rpPnlStatement(res.topline||{}) }];
   var dp=res.deptPnL;
@@ -2716,7 +2958,17 @@ function rpTableFromReorder(res){
 }
 var REPORTS=[
   {id:'pnl',       label:'Summary P&L — Manager view',       cap:'Report: Summary P&L',    compare:true, inputs:['range'], run:function(p){ return api('getSummaryPnLTopline',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromPnL},
-  {id:'fullpnl',   label:'Summary P&L — Full',                cap:'Report: Full P&L',       compare:true, inputs:['range'], run:function(p){ return api('getFullPnL',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromFullPnL},
+  /* Replaced: was getFullPnL + rpTableFromFullPnL. Now the management format.
+     _rpBeTarget is stashed in run() because table() only ever receives the
+     server response, and the break-even target is a client-side input. */
+  {id:'fullpnl',   label:'Summary P&L — Full',                cap:'Report: Full P&L',       compare:true,
+     inputs:['range',{k:'target',label:'Break-even target consumption %',kind:'text',ph:'35'}],
+     run:function(p){ _rpBeTarget=parseFloat(p.target)||35; return api('getPnLPack',{fromKey:p.from,toKey:p.to}); },
+     table:rpTableFromPnLPack},
+  {id:'foodcost',  label:'Food Cost report',                  cap:'Report: Food Cost',      compare:true, inputs:['range'],
+     run:function(p){ return api('getFoodCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromFoodCost},
+  {id:'bevcost',   label:'Beverage Cost report',              cap:'Report: Beverage Cost',  compare:true, inputs:['range'],
+     run:function(p){ return api('getBeverageCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromBevCost},
   {id:'stockmove', label:'Stock movement (Open/Purch/Issued/Close)', cap:'Report: Stock Movement', inputs:['range'], run:function(p){ return api('getStockReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromStockReport},
   {id:'livestock', label:'Live stock (on hand now)',         cap:'Report: Live Stock',     inputs:[],        run:function(p){ return api('getStockStatus'); }, table:rpTableFromLiveStock},
   {id:'stockitem', label:'Stock Item Analysis (Purchase/Issue/Return)', cap:'Report: Stock Item Analysis', inputs:['range',{k:'type',label:'Type',kind:'select',options:[['purchase','Purchase'],['issue','Issue'],['return','Return'],['fifolayers','FIFO layers']]},{k:'category',label:'Category (optional)',kind:'text',list:'rpCatList',ph:'All'},{k:'item',label:'Item (optional)',kind:'text',list:'rpItemList',ph:'All'}], run:function(p){ return api('getStockItemsAnalysis',{type:p.type||'purchase',fromKey:p.from,toKey:p.to,category:p.category||'',item:p.item||''}); }, table:rpTablePass},
