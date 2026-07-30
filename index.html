@@ -2850,13 +2850,18 @@ function rpTableFromPnLPack(res){
   S.push({ title:'ANNEXURE 3 | DEPARTMENT-WISE GROSS PROFIT',
     headers:['Department','Revenue (Rs.)','Consumption (Rs.)','Return (Rs.)','Gross Profit (Rs.)'], rows:a3 });
 
-  var tot4=0; (res.a4||[]).forEach(function(r){ tot4+=r.net||0; });
+  /* % is taken on ISSUE, not on net. Consumption in this P&L is gross issue
+     value, so basing the mix on anything else gives percentages that cannot be
+     tied back to the consumption figure in section B. Spoilage is shown but
+     excluded from Net, because the P&L excludes it too \u2014 it is a memo item. */
+  var t4i=0,t4r=0,t4s=0; (res.a4||[]).forEach(function(r){ t4i+=r.iss||0; t4r+=r.ret||0; t4s+=r.spo||0; });
   var a4=(res.a4||[]).map(function(r){
-    return [r.category, rpNum(r.iss), rpNum(r.ret), rpNum(r.spo), rpNum(r.net),
-            tot4>0?rpP(r.net/tot4):'\u2014']; });
-  a4.push(['Total', '', '', '', rpNum(tot4), tot4>0?'100.00%':'\u2014']);
+    return [r.category, rpNum(r.iss), rpNum(r.ret), rpNum(r.spo),
+            rpNum((r.iss||0)-(r.ret||0)),
+            t4i>0?rpP((r.iss||0)/t4i):'\u2014']; });
+  a4.push(['Total', rpNum(t4i), rpNum(t4r), rpNum(t4s), rpNum(t4i-t4r), t4i>0?'100.00%':'\u2014']);
   S.push({ title:'ANNEXURE 4 | CONSUMPTION BY CATEGORY',
-    headers:['Category','Issue (Rs.)','Return (Rs.)','Spoilage (Rs.)','Net Consumption (Rs.)','% of Total'], rows:a4 });
+    headers:['Category','Issue (Rs.)','Return (Rs.)','Spoilage (Rs.)','Net of Returns (Rs.)','% of Issue'], rows:a4 });
 
   /* A tolerance of one rupee, not zero: FIFO rates carry more decimal places
      than the archive stores, so an exact-zero test would flag healthy periods. */
