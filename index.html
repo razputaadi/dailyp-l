@@ -1904,8 +1904,8 @@ function submitIssue(){
      handoff variable. _issueReqId is set when a requirement is pushed into this
      form, but it is wiped by a tab switch (see the guard in renderTabs) and it is
      NOT restored when a short-stock line comes back from Pending. In both cases
-     the issue still carried its REQ number — it goes into Issue_Archive
-     column B — yet the requirement was never credited and stayed Open for
+     the issue still carried its REQ number \u2014 it goes into Issue_Archive
+     column B \u2014 yet the requirement was never credited and stayed Open for
      goods that had already left the store. #iReq is filled by applyIssuePrefill
      on both of those paths, and by hand on the third, so it is the reliable
      source. Guarded by the REQ- prefix so a free-text note in that optional
@@ -1938,44 +1938,21 @@ function saveIssueAsync(rows, label, editId, reqId){
        partially fail (short stock routes a line to Pending), so submitted minus
        failed is the only honest number — crediting the whole submission would
        mark a requirement served for goods still sitting in the store. */
-    if(reqId){
-      var _short={};
-      (res.failed||[]).forEach(function(fr){
-        var it=String(fr[2]||'').trim().toLowerCase();
-        if(it) _short[it]=(_short[it]||0)+(parseFloat(fr[3])||0);
+    /* The requirement is credited SERVER-SIDE now, inside processIssues, from the
+       rows it actually wrote. This block used to make a second api() call from
+       here — and that is what broke when several issues were submitted together:
+       writes go through the durable queue, qPoll gave up with queuedStill, the
+       promise above threw, and this call never happened. The issue still landed
+       via gyvQueueTick, so stock moved and the requirement stayed Open. A
+       two-step write driven from a client that may stop listening cannot be made
+       reliable, so it is one step on the server instead.
+       reqId is still captured above: it is what puts REQ_SR on the issue rows. */
+    if(res.reqStatuses){
+      Object.keys(res.reqStatuses).forEach(function(rq){
+        var st=res.reqStatuses[rq];
+        if(String(st).indexOf('ERROR')===0) toast(rq+' not updated: '+st, true);
+        else toast(rq+' \u2192 '+st);
       });
-      var _done=[];
-      rows.forEach(function(rw){
-        var it=String(rw[2]||'').trim(), k=it.toLowerCase();
-        var sub=parseFloat(rw[3])||0;
-        var cut=Math.min(sub, _short[k]||0);
-        if(cut){ _short[k]-=cut; }
-        var q=Math.round((sub-cut)*1000)/1000;
-        if(it && q>0) _done.push([it,q]);
-      });
-      if(_done.length){
-        afterI=afterI.then(function(){
-          return api('recordREQIssue',{reqId:reqId, rows:_done}).then(function(rr){
-            if(rr && rr.ok){
-              var t=reqId+' \u2192 '+rr.status;
-              /* Items issued that are not on the requirement. Worth saying out
-                 loud: it usually means a substitution nobody recorded. */
-              if(rr.unmatchedItems && rr.unmatchedItems.length){
-                t+='  ('+rr.unmatchedItems.length+' item(s) not on this requirement)';
-              }
-              toast(t);
-            } else {
-              /* This used to fail silently, which is how a requirement stayed
-                 Open while the stock had already gone out. Say it. */
-              toast('Issued, but '+reqId+' status not updated: '+
-                    ((rr&&rr.error)||'unknown'), true);
-            }
-          }).catch(function(e){
-            toast('Issued, but '+reqId+' status not updated: '+
-                  ((e&&e.message)||'request failed'), true);
-          });
-        });
-      }
     }
     if(res.errors && res.errors.length){
       // partial: the lines that DID post are saved; queue only the ones that didn't.
@@ -3003,7 +2980,21 @@ var REPORTS=[
      run:function(p){ return api('getBeverageCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromBevCost},
   {id:'stockmove', label:'Stock movement (Open/Purch/Issued/Close)', cap:'Report: Stock Movement', inputs:['range'], run:function(p){ return api('getStockReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromStockReport},
   {id:'livestock', label:'Live stock (on hand now)',         cap:'Report: Live Stock',     inputs:[],        run:function(p){ return api('getStockStatus'); }, table:rpTableFromLiveStock},
-  {id:'stockitem', label:'Stock Item Analysis (Purchase/Issue/Return)', cap:'Report: Stock Item Analysis', inputs:['range',{k:'type',label:'Type',kind:'select',options:[['purchase','Purchase'],['issue','Issue'],['return','Return'],['fifolayers','FIFO layers']]},{k:'category',label:'Category (optional)',kind:'text',list:'rpCatList',ph:'All'},{k:'item',label:'Item (optional)',kind:'text',list:'rpItemList',ph:'All'}], run:function(p){ return api('getStockItemsAnalysis',{type:p.type||'purchase',fromKey:p.from,toKey:p.to,category:p.category||'',item:p.item||''}); }, table:rpTablePass},
+  {id:'stockitem', label:'Stock Item Analysis (Purchase/Issue/Return)', cap:'Report: Stock Item Analysis', inputs:['range',{k:'type',label:'Type',kind:'select',options:[['purchase','Purchase'],['issue','Issue'],['return','Return'],['fifolayers','FIFO layers']]},{k:'category',label:'Category (optional)',kind:'text',list:'rpCatList',ph:'All'},{k:'item',label:'Item (optional)',kind:'text',list:'rpItemList',ph:'All'}], run:function(p){
+     var t=p.type||'purchase';
+     /* FIFO layers is a different question from a movement report, and it already
+        had its own endpoint — getStockFifoLayers, registered in the gateway with
+        its own capability — which was simply never wired up. The dropdown offered
+        the option while getStockItemsAnalysis only implements purchase/issue/
+        return, so the server correctly answered "Unknown type: fifolayers".
+        Layers are a POSITION AS OF a date, not a flow across a range, so only
+        toKey carries meaning here and fromKey is deliberately not sent. Venue is
+        injected by the gateway from the session, so it is not passed either. */
+     if(t==='fifolayers'){
+       return api('getStockFifoLayers',{toKey:p.to,category:p.category||'',item:p.item||''});
+     }
+     return api('getStockItemsAnalysis',{type:t,fromKey:p.from,toKey:p.to,category:p.category||'',item:p.item||''});
+   }, table:rpTablePass},
   {id:'sales',     label:'Sales — list',                     cap:'Report: Sales List',     inputs:['range'], run:function(p){ return api('getArchiveView',{archive:'Sales_Archive',fromKey:p.from,toKey:p.to}); }, table:rpTableFromHeadersRows},
   {id:'spoil',     label:'Spoilage — list',                  cap:'Report: Spoilage List',  inputs:['range'], run:function(p){ return api('getArchiveView',{archive:'Spoilage_Archive',fromKey:p.from,toKey:p.to}); }, table:rpTableFromHeadersRows},
   {id:'reorder',   label:'Reorder / low stock',              cap:'Report: Reorder',        inputs:[],        run:function(p){ return api('getStockStatus'); }, table:rpTableFromReorder},
