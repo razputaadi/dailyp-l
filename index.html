@@ -1900,7 +1900,18 @@ function submitIssue(){
   if(!rows.length){ msg.textContent='Add at least one item.'; return; }
   var label = dept + (req?(' · '+req):'');
   var editId=_editingPendingId; _editingPendingId=null;
-  var reqId=_issueReqId; _issueReqId=null;
+  /* The requirement link comes from the FIELD, not only from the in-memory
+     handoff variable. _issueReqId is set when a requirement is pushed into this
+     form, but it is wiped by a tab switch (see the guard in renderTabs) and it is
+     NOT restored when a short-stock line comes back from Pending. In both cases
+     the issue still carried its REQ number — it goes into Issue_Archive
+     column B — yet the requirement was never credited and stayed Open for
+     goods that had already left the store. #iReq is filled by applyIssuePrefill
+     on both of those paths, and by hand on the third, so it is the reliable
+     source. Guarded by the REQ- prefix so a free-text note in that optional
+     field cannot trigger a pointless server call. */
+  var reqId=_issueReqId || (/^REQ-/i.test(req) ? req : '');
+  _issueReqId=null;
   buildIssueForm();
   saveIssueAsync(rows, label, editId, reqId);
 }
@@ -1945,8 +1956,24 @@ function saveIssueAsync(rows, label, editId, reqId){
       if(_done.length){
         afterI=afterI.then(function(){
           return api('recordREQIssue',{reqId:reqId, rows:_done}).then(function(rr){
-            if(rr && rr.ok) toast(reqId+' \u2192 '+rr.status);
-          }).catch(function(){});
+            if(rr && rr.ok){
+              var t=reqId+' \u2192 '+rr.status;
+              /* Items issued that are not on the requirement. Worth saying out
+                 loud: it usually means a substitution nobody recorded. */
+              if(rr.unmatchedItems && rr.unmatchedItems.length){
+                t+='  ('+rr.unmatchedItems.length+' item(s) not on this requirement)';
+              }
+              toast(t);
+            } else {
+              /* This used to fail silently, which is how a requirement stayed
+                 Open while the stock had already gone out. Say it. */
+              toast('Issued, but '+reqId+' status not updated: '+
+                    ((rr&&rr.error)||'unknown'), true);
+            }
+          }).catch(function(e){
+            toast('Issued, but '+reqId+' status not updated: '+
+                  ((e&&e.message)||'request failed'), true);
+          });
         });
       }
     }
