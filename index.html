@@ -308,6 +308,18 @@
   .lowtag{font-size:9px; font-weight:700; letter-spacing:.06em; background:var(--danger-soft); color:var(--danger); padding:1px 5px; border-radius:4px; vertical-align:middle}
   .stktot{margin-top:10px; font-size:13px; color:var(--muted)} .stktot b{color:var(--ink); font-family:var(--mono)}
 
+  /* requirement reminder */
+  .reqalert{margin:10px 12px 0; padding:10px 12px; background:#FFF8E6;
+            border:1px solid var(--warn); border-left-width:4px; border-radius:var(--radius-sm)}
+  .reqalert h4{margin:0 0 2px; font-family:var(--display); font-size:11px; font-weight:600;
+               text-transform:uppercase; letter-spacing:.07em; color:#8A5A00}
+  .reqalert ul{margin:6px 0 8px; padding-left:18px; font-size:13px}
+  .reqalert li{margin:2px 0}
+  .reqalert .ra-acts{display:flex; gap:8px; flex-wrap:wrap}
+  .tabbadge{display:inline-block; min-width:16px; margin-left:6px; padding:0 5px; border-radius:9px;
+            background:var(--danger); color:#fff; font-size:10px; font-weight:700; line-height:16px;
+            text-align:center; vertical-align:middle}
+
   /* reports */
   .rptmeta{font-size:12px; color:var(--muted); margin:6px 0}
   table.rptbl td{ font-size:12px; white-space:nowrap; font-family:var(--mono) }
@@ -399,6 +411,7 @@
     </div>
   </div>
 
+  <div id="reqAlertSlot"></div>
   <nav class="tabs" id="tabs"></nav>
   <main id="main"></main>
 </div>
@@ -625,6 +638,7 @@ function draftClearAllForUser(){
 }
 function doLogout(){
   draftClearAllForUser();
+  reqAlertStop();
   api('logout').catch(function(){}).then(function(){
     state.session=null; state.me=null; saveSession(''); _usersCache=null;
     $('app').classList.add('hidden'); $('login').classList.remove('hidden');
@@ -642,6 +656,7 @@ function renderApp(){
   $('whoRole').textContent=state.me.role;
   renderVenueBar();
   renderTabs();
+  reqAlertStart();
 }
 function renderVenueBar(){
   var bar=$('venuebar'), v=state.me.venue;
@@ -687,9 +702,11 @@ function renderTabs(){
   visible.forEach(function(d){
     var b=document.createElement('button');
     b.textContent=d.label; b.className=(d.id===activeTab?'active':'');
+    b.setAttribute('data-tab', d.id);
     b.onclick=function(){ activeTab=d.id; renderTabs(); };
     nav.appendChild(b);
   });
+  paintReqBadge();
   renderMain();
 }
 function renderMain(){
@@ -712,6 +729,7 @@ function renderMain(){
   if(def.id==='receiving'){ renderReceiving(m); return; }
   if(def.id==='requirements'){ renderRequirements(m); return; }
   if(def.id==='bills'){ renderBills(m); return; }
+  if(def.id==='returns'){ renderReturns(m); return; }
   m.innerHTML='<div class="card"><div class="stub">'+
     '<div class="big">'+esc(def.label)+'</div>'+
     '<div>This section will be wired up next.</div></div></div>';
@@ -1541,7 +1559,7 @@ function acCloseAll(){
    Deliberately ABSENT: rpItemList and rpCatList (report filters, where a partial
    string is the whole point), vendors, and departments. Sales needs nothing —
    its item field is readonly with a fixed value. */
-var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1 };
+var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1, retItemsDL:1 };
 
 function acUpgrade(){
   Array.prototype.forEach.call(document.querySelectorAll('input[list]'), function(inp){
@@ -2003,6 +2021,344 @@ function renderFailedIssues(){
   });
 }
 
+/* ---------------- Returns / closing stock entry ----------------
+   Return_Archive rows are a POSITION, not a movement: one entry per department
+   per count date, stating what is still physically on hand. The server values
+   each line at the last issue rate for that department and item on or before the
+   entry date, and deliberately touches no stock — the goods left the store when
+   they were issued, they just have not been consumed yet.
+   The P&L reads the latest count in the period as closing and the count on the
+   day before the period as opening, so entering the same department twice in a
+   month is safe: only the later one applies. */
+var rMode='form';
+function renderReturns(m){
+  if(state.me.venue==='ALL'){
+    m.innerHTML='<div class="card"><h2>Returns / closing stock</h2>'+
+      '<p class="sub">You\u2019re viewing <b>All venues</b>. Pick one venue in the bar above to enter a count.</p></div>';
+    return;
+  }
+  m.innerHTML='<div class="card"><h2>Returns / closing stock</h2>'+
+    '<div class="sub">Recording for <b>'+esc(venueDisplay(state.me.venue))+'</b>. '+
+      'Each line is valued at the last issue rate for that department and item, on or before the count date. '+
+      'Stock is not affected. One count = one date + department.</div>'+
+    '<div class="subtabs"><button id="rmForm">Form</button><button id="rmImport">Import CSV</button></div>'+
+    '<div id="rStatus"></div><div id="rBody"></div></div>';
+  $('rmForm').onclick=function(){ rMode='form'; paintRmTabs(); rShowForm(); };
+  $('rmImport').onclick=function(){ rMode='import'; paintRmTabs(); renderCsvImport('rBody', RETURN_IMPORT); };
+  paintRmTabs();
+  if(rMode==='import'){ renderCsvImport('rBody', RETURN_IMPORT); } else { rShowForm(); }
+}
+function paintRmTabs(){ $('rmForm').className=(rMode==='form'?'active':''); $('rmImport').className=(rMode==='import'?'active':''); }
+function rShowForm(){ $('rBody').innerHTML='<div id="rForm"><div class="stub">Loading\u2026</div></div>'; ensureItems(function(){ buildReturnForm(); }); }
+function buildReturnForm(){
+  var deps=_itemsCache.departments||[];
+  var deptOpts=deps.map(function(d){ return '<option value="'+esc(d)+'"></option>'; }).join('');
+  var f=$('rForm');
+  f.innerHTML=''+
+    '<datalist id="retItemsDL"></datalist>'+
+    '<datalist id="rDeptsDL">'+deptOpts+'</datalist>'+
+    '<div class="pbill">'+
+      '<div class="field"><label>Count date</label><input type="date" id="rDate" value="'+esc(todayStr())+'"></div>'+
+      '<div class="field"><label>Department</label><input id="rDept" list="rDeptsDL" placeholder="Type or pick"></div>'+
+      '<div class="field full"><label>Notes</label><input id="rNotes" placeholder="Optional \u2014 applies to every line"></div>'+
+    '</div>'+
+    '<div class="actions"><button class="btn secondary small" id="rLoad">Load items issued to this department</button></div>'+
+    '<div class="msg" id="rLoadMsg"></div>'+
+    '<div class="ilabels"><span>Item</span><span>Qty on hand</span><span></span></div>'+
+    '<div id="rLines"></div>'+
+    '<div class="actions"><button class="btn secondary small" id="rAddLine">+ Add item</button></div>'+
+    '<div class="actions"><button class="btn small" id="rSubmit">Submit count</button>'+
+      '<button class="btn secondary small" id="rClear">Clear</button></div>'+
+    '<div class="msg" id="rMsg"></div>';
+  $('rAddLine').onclick=function(){ addReturnLine(); };
+  $('rClear').onclick=function(){ buildReturnForm(); };
+  $('rSubmit').onclick=submitReturn;
+  $('rLoad').onclick=rLoadIssued;
+  if(_pendingPrefill && _pendingPrefill.type==='return'){ var pf=_pendingPrefill; _pendingPrefill=null; applyReturnPrefill(pf.rows); }
+  else { addReturnLine(); }
+}
+/* item/qty are optional: supplied by the prefill paths, omitted for a manual add.
+   acUpgrade is NOT called here — the MutationObserver in acWatch() picks up the
+   new input before paint and applies strict mode via AC_STRICT_LISTS. */
+function addReturnLine(item, qty){
+  var wrap=document.createElement('div'); wrap.className='iline';
+  wrap.innerHTML=''+
+    '<input class="rItem" list="retItemsDL" placeholder="Item">'+
+    '<input class="rQty" type="text" inputmode="decimal" placeholder="0">'+
+    '<button class="pDel" title="Remove line" type="button">\u00d7</button>';
+  $('rLines').appendChild(wrap);
+  var rIt=wrap.querySelector('.rItem'), rQ=wrap.querySelector('.rQty');
+  if(item!=null && item!=='') rIt.value=item;
+  if(qty!=null) rQ.value=qty;
+  rIt.onchange=function(){ var u=acUomOf(rIt.value); rQ.placeholder=u?('Qty in '+u):'0'; };
+  if(rIt.value){ var u0=acUomOf(rIt.value); if(u0) rQ.placeholder='Qty in '+u0; }
+  wrap.querySelector('.pDel').onclick=function(){ wrap.parentNode.removeChild(wrap); };
+  if(!rIt.value) revealRow(wrap, rIt);
+  return wrap;
+}
+function applyReturnPrefill(rows){
+  if(!rows || !rows.length){ addReturnLine(); return; }
+  var f=rows[0];
+  if(f[0]) $('rDate').value=String(f[0]).slice(0,10);
+  if(f[1]) $('rDept').value=String(f[1]);
+  if(f[4]) $('rNotes').value=String(f[4]);
+  rows.forEach(function(r){ addReturnLine(String(r[2]||''), String(r[3]==null?'':r[3])); });
+}
+/* Prefill from what was actually issued to this department, month-to-date. Two
+   reasons this is worth a button: typing thirty item names on a phone at
+   month-end is the slowest part of the job, and a line can only be VALUED if
+   that department had the item issued to it — so a list built from issues is a
+   list that cannot be rejected. Items issued earlier than this month can still
+   be added by hand; they will value off their own older issue. */
+function rLoadIssued(){
+  var date=$('rDate').value, dept=$('rDept').value.trim();
+  var msg=$('rLoadMsg'); msg.className='msg'; msg.textContent='';
+  if(!date){ msg.className='msg err'; msg.textContent='Pick a count date first.'; return; }
+  if(!dept){ msg.className='msg err'; msg.textContent='Pick a department first.'; return; }
+  var from=date.slice(0,8)+'01';
+  var btn=$('rLoad'); if(btn) btn.disabled=true;
+  msg.textContent='Loading items issued to '+dept+' from '+from+' to '+date+'\u2026';
+  api('getItemwiseConsumption',{fromKey:from,toKey:date}).then(function(res){
+    if(btn) btn.disabled=false;
+    if(!res.ok){ msg.className='msg err'; msg.textContent=res.error||'Could not load'; return; }
+    var dn=String(dept).replace(/\s+/g,' ').trim().toLowerCase();
+    var seen={}, names=[];
+    (res.rows||[]).forEach(function(r){
+      if(String(r[4]||'').replace(/\s+/g,' ').trim().toLowerCase()!==dn) return;
+      var it=String(r[1]||'').trim();
+      if(!it || seen[it.toLowerCase()]) return;
+      seen[it.toLowerCase()]=1; names.push(it);
+    });
+    if(!names.length){
+      msg.className='msg err';
+      msg.textContent='Nothing was issued to '+dept+' between '+from+' and '+date+'.';
+      return;
+    }
+    names.sort(function(a,b){ return a.localeCompare(b); });
+    var existing={};
+    Array.prototype.forEach.call(document.querySelectorAll('#rLines .iline'), function(w){
+      var v=w.querySelector('.rItem').value.trim();
+      if(v) existing[v.toLowerCase()]=1;
+      else if(w.parentNode) w.parentNode.removeChild(w);   // drop blank placeholders
+    });
+    var added=0;
+    names.forEach(function(n){ if(existing[n.toLowerCase()]) return; addReturnLine(n, ''); added++; });
+    msg.className='msg';
+    msg.textContent=added+' item'+(added===1?'':'s')+' loaded. Enter the quantity still on hand; delete any line where nothing is left.';
+  }).catch(function(e){
+    if(btn) btn.disabled=false;
+    msg.className='msg err'; msg.textContent=(e&&e.message)||'Could not load';
+  });
+}
+function submitReturn(){
+  var date=$('rDate').value, dept=$('rDept').value.trim(), notes=$('rNotes').value.trim();
+  var msg=$('rMsg'); msg.className='msg err'; msg.textContent='';
+  if(!date){ msg.textContent='Pick a count date.'; return; }
+  if(!dept){ msg.textContent='Pick a department.'; return; }
+  var rows=[], bad=false, unknown=[], dupes={}, dupeNames=[];
+  Array.prototype.forEach.call(document.querySelectorAll('#rLines .iline'), function(w){
+    var rEl=w.querySelector('.rItem');
+    var u=(typeof acItemUnknown==='function')?acItemUnknown(rEl):''; if(u) unknown.push(u);
+    var item=rEl.value.trim(), qty=w.querySelector('.rQty').value;
+    if(!item && qty===''){ return; }                      // fully empty line -> skip
+    if(!item || qty===''){ bad=true; return; }
+    var k=item.toLowerCase();
+    if(dupes[k]) dupeNames.push(item); else dupes[k]=1;
+    rows.push([date, dept, item, qty, notes]);
+  });
+  if(unknown.length){ msg.textContent='Not in Item Master: '+unknown.join(', ')+'. Pick from the list.'; return; }
+  if(bad){ msg.textContent='Each line needs an item and a quantity (or clear the line).'; return; }
+  /* A position must not contain the same item twice — the P&L sums the rows of a
+     count, so two lines for one item would overstate the closing balance. */
+  if(dupeNames.length){ msg.textContent='Same item listed twice: '+dupeNames.join(', ')+'. Merge into one line.'; return; }
+  if(!rows.length){ msg.textContent='Add at least one item.'; return; }
+  var label=dept+' \u00b7 '+date;
+  var editId=_editingPendingId; _editingPendingId=null;
+  buildReturnForm();
+  saveReturnAsync(rows, label, editId);
+}
+var _rSaveSeq=0;
+function saveReturnAsync(rows, label, editId){
+  var id='rv'+(++_rSaveSeq), s=$('rStatus');
+  if(s){
+    var chip=document.createElement('div'); chip.className='savechip saving'; chip.id=id;
+    chip.innerHTML='<span class="spin sc-spin"></span><span class="sc-text">Saving '+esc(label)+'\u2026</span>';
+    s.appendChild(chip);
+  }
+  api('processReturns', {rows:rows}).then(function(res){
+    if(!res.ok){
+      var _e=new Error(res.error||'Save failed');
+      _e.busy=!!res.busy; _e.queuedStill=!!res.queuedStill;
+      throw _e;
+    }
+    var c=$(id); if(c&&c.parentNode) c.parentNode.removeChild(c);
+    if(editId){ api('deletePending',{id:editId}).catch(function(){}); }
+    if(s){
+      var ok=document.createElement('div'); ok.className='savechip ok';
+      ok.innerHTML='<span class="sc-tick">\u2713</span><span class="sc-text">'+esc(label)+' \u00b7 '+(res.count||0)+' recorded</span>';
+      s.appendChild(ok);
+      setTimeout(function(){ if(ok&&ok.parentNode) ok.parentNode.removeChild(ok); }, 3500);
+    }
+    /* Skipped rows get a table, not a toast. A skip means the line was NOT
+       written: the department had no issue of that item on or before the count
+       date, so there is no rate to value it at. On a stock-take that is a hole in
+       the count, and a toast that fades in three seconds is how it goes
+       unnoticed until the P&L looks wrong a month later. */
+    if(res.skipped && res.skipped.length){ renderReturnSkipped(res.skipped); }
+    else if(res.errors && res.errors.length){ toast(res.errors.join('; '), true); }
+  }).catch(function(e){
+    var c=$(id); if(c&&c.parentNode) c.parentNode.removeChild(c);
+    if(e && (e.queuedStill || e.timedOut)){
+      /* Already in Submission_Queue; a Pending copy would double it. */
+      toast(e.message, true);
+    } else if(editId){
+      toast('Couldn\u2019t reach server \u2014 still in Pending', true);
+    } else {
+      queuePending('return', 'Connection failed \u2014 verify before reprocessing', rows, 'Sent to Pending');
+    }
+  });
+}
+function renderReturnSkipped(list){
+  var s=$('rStatus'); if(!s) return;
+  var old=$('rSkipBox'); if(old&&old.parentNode) old.parentNode.removeChild(old);
+  var box=document.createElement('div'); box.className='card'; box.id='rSkipBox';
+  var h='<h2>'+list.length+' line'+(list.length===1?'':'s')+' could not be valued</h2>'+
+    '<p class="sub">These were <b>not saved</b>. A line can only be valued if that department '+
+    'had the item issued to it on or before the count date \u2014 issue it first, or drop the line.</p>'+
+    '<div class="matrix-wrap"><table class="matrix rptbl"><thead><tr>'+
+    '<th class="cap">Department</th><th class="cap">Item</th><th>Qty</th><th class="cap">Reason</th>'+
+    '</tr></thead><tbody>';
+  list.forEach(function(k){
+    h+='<tr><td class="cap">'+esc(k.dept||'')+'</td><td class="cap">'+esc(k.item||'')+'</td>'+
+       '<td>'+esc(String(k.qty==null?'':k.qty))+'</td><td class="cap">'+esc(k.reason||'')+'</td></tr>';
+  });
+  h+='</tbody></table></div><div class="actions"><button class="btn secondary small" id="rSkipClose">Dismiss</button></div>';
+  box.innerHTML=h;
+  s.appendChild(box);
+  $('rSkipClose').onclick=function(){ if(box.parentNode) box.parentNode.removeChild(box); };
+}
+
+/* ---------------- Requirement reminder ----------------
+   In-app only, and deliberately so. Web Push needs VAPID signing plus a store of
+   subscriptions, and Apps Script cannot practically be that backend; on iOS it
+   only reaches an installed PWA at all. So the reminder is a banner the
+   storekeeper sees when the app is in front of them — which is the moment they
+   can actually act on it.
+
+   It refreshes on login, whenever the app returns to the foreground, immediately
+   after a requirement is raised, and on a timer WHILE VISIBLE. Never while
+   hidden: every call is an Apps Script execution billed against one shared daily
+   runtime budget, so polling a backgrounded tab spends quota to tell nobody
+   anything. */
+var REQ_ALERT_MS = 90000;            // foreground poll interval
+var REQ_ALERT_SNOOZE_H = 3;          // a dismissal lapses after this long
+var REQ_ALERT_FLOOR_MS = 30000;      // hard floor between calls, whatever asks
+var _reqAlert = { count:0, reqs:[], last:0, timer:null, busy:false };
+
+function reqSnoozeKey(){
+  return 'gyvReqSnooze:'+((state.me&&state.me.username)||'')+':'+((state.me&&state.me.venue)||'');
+}
+function reqSnoozeRead(){
+  try{ return JSON.parse(localStorage.getItem(reqSnoozeKey())||'{}')||{}; }catch(e){ return {}; }
+}
+function reqSnoozeWrite(o){ try{ localStorage.setItem(reqSnoozeKey(), JSON.stringify(o)); }catch(e){} }
+/* Dismissal is per REQ_ID and it LAPSES. A requirement still pending three hours
+   after it was waved away comes back, and every three hours after that — the
+   difference between informing once and letting a requirement rot unserved.
+   Keyed per user AND per venue so a dismissal on one venue is not silence on the
+   other. */
+function reqSnoozeActive(reqId){
+  var t=reqSnoozeRead()[reqId];
+  if(!t) return false;
+  return (Date.now()-t) < REQ_ALERT_SNOOZE_H*3600000;
+}
+function reqSnoozePrune(live){
+  /* Drop dismissals for requirements that are no longer pending, otherwise the
+     store grows without limit on a till that never gets cleared. */
+  var s=reqSnoozeRead(), keep={}, any=false;
+  (live||[]).forEach(function(q){ if(s[q.reqId]){ keep[q.reqId]=s[q.reqId]; any=true; } });
+  if(any || Object.keys(s).length) reqSnoozeWrite(keep);
+}
+function reqAlertStart(){
+  reqAlertStop();
+  if(!cap('Alert: Requirement Reminder')) return;
+  reqAlertTick(true);
+  _reqAlert.timer=setInterval(function(){
+    if(document.hidden) return;
+    reqAlertTick(false);
+  }, REQ_ALERT_MS);
+}
+function reqAlertStop(){
+  if(_reqAlert.timer){ clearInterval(_reqAlert.timer); _reqAlert.timer=null; }
+  _reqAlert.count=0; _reqAlert.reqs=[]; _reqAlert.last=0;
+  paintReqBadge(); reqAlertPaint();
+}
+function reqAlertTick(force){
+  if(!cap('Alert: Requirement Reminder')) return;
+  if(_reqAlert.busy) return;
+  if(!force && (Date.now()-_reqAlert.last) < REQ_ALERT_FLOOR_MS) return;
+  _reqAlert.busy=true;
+  api('getRequirementAlert',{}).then(function(res){
+    _reqAlert.busy=false; _reqAlert.last=Date.now();
+    if(!res || !res.ok) return;
+    _reqAlert.count=res.count||0;
+    _reqAlert.reqs=res.reqs||[];
+    reqSnoozePrune(_reqAlert.reqs);
+    paintReqBadge(); reqAlertPaint();
+  }).catch(function(){
+    /* Silent. A reminder that shouts about its own connectivity is worse than a
+       reminder that arrives ninety seconds late. */
+    _reqAlert.busy=false; _reqAlert.last=Date.now();
+  });
+}
+function reqAlertPaint(){
+  var host=$('reqAlertSlot'); if(!host) return;
+  var show=(_reqAlert.reqs||[]).filter(function(q){ return !reqSnoozeActive(q.reqId); });
+  if(!show.length){ host.innerHTML=''; return; }
+  var lines=show.slice(0,6).map(function(q){
+    var age=(q.ageHours===''||q.ageHours==null)?''
+           :(q.ageHours<1?'just now':(q.ageHours+'h waiting'));
+    var dim=function(t){ return '<span style="color:var(--muted)">'+esc(t)+'</span>'; };
+    return '<li><b>'+esc(q.reqId)+'</b> \u00b7 '+esc(q.dept||'')+
+           ' \u00b7 '+q.lines+' item'+(q.lines===1?'':'s')+
+           (q.qtyPending?(' \u00b7 pending '+qn(q.qtyPending)):'')+
+           (age?(' \u00b7 '+dim(age)):'')+
+           (q.raisedBy?(' \u00b7 '+dim(q.raisedBy)):'')+'</li>';
+  }).join('');
+  host.innerHTML='<div class="reqalert">'+
+    '<h4>'+show.length+' requirement'+(show.length===1?'':'s')+' waiting to be issued</h4>'+
+    '<ul>'+lines+'</ul>'+
+    (show.length>6?('<div class="sub" style="margin:0 0 8px">and '+(show.length-6)+' more\u2026</div>'):'')+
+    '<div class="ra-acts">'+
+      '<button class="btn small" id="raOpen">Open requirements</button>'+
+      '<button class="btn secondary small" id="raHide">Dismiss</button>'+
+    '</div></div>';
+  $('raOpen').onclick=function(){ activeTab='requirements'; rqMode='list'; renderTabs(); };
+  $('raHide').onclick=function(){
+    var s=reqSnoozeRead(), now=Date.now();
+    show.forEach(function(q){ s[q.reqId]=now; });
+    reqSnoozeWrite(s); reqAlertPaint();
+  };
+}
+/* The badge ignores dismissal on purpose: dismissing says "not now", not "stop
+   counting". It is the passive half of "just inform". */
+function paintReqBadge(){
+  var b=document.querySelector('#tabs button[data-tab="requirements"]');
+  if(!b) return;
+  var old=b.querySelector('.tabbadge');
+  if(old && old.parentNode) old.parentNode.removeChild(old);
+  var n=_reqAlert.count||0;
+  if(n>0){
+    var sp=document.createElement('span'); sp.className='tabbadge'; sp.textContent=n;
+    b.appendChild(sp);
+  }
+}
+/* Foreground return is the cheapest trigger there is and the one that matters on
+   a phone: the storekeeper unlocks the screen and the banner is already current. */
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden) reqAlertTick(true);
+});
+
 /* ---------------- Pending / unprocessed entries ---------------- */
 var _pendingPrefill=null, _editingPendingId=null;
 function toDateInput(v){
@@ -2147,7 +2503,7 @@ function renderPendingList(list){
   if(!list.length){ b.innerHTML='<div class="stub">Nothing pending — all clear.</div>'; return; }
   b.innerHTML=list.map(function(p){
     var lines=(p.rows||[]).length;
-    var typeLabel=p.type==='issue'?'Issue':(p.type==='purchase'?'Purchase':esc(p.type));
+    var typeLabel=p.type==='issue'?'Issue':(p.type==='purchase'?'Purchase':(p.type==='return'?'Return / closing':esc(p.type)));
     return '<div class="pendrow">'+
       '<div class="pendmain"><div class="pendtype">'+typeLabel+' · '+lines+' line'+(lines>1?'s':'')+
         (p.venue?(' · '+esc(p.venue)):'')+'</div>'+
@@ -2176,6 +2532,7 @@ function editPending(p){
   _editingPendingId=p.id;
   if(p.type==='purchase'){ pMode='form'; activeTab='purchases'; renderTabs(); toast('Loaded into Purchases — fix and resubmit'); }
   else if(p.type==='issue'){ iMode='form'; activeTab='issues'; renderTabs(); toast('Loaded into Issues — fix and resubmit'); }
+  else if(p.type==='return'){ rMode='form'; activeTab='returns'; renderTabs(); toast('Loaded into Returns — fix and resubmit'); }
   else if(p.type==='sale'){ _pendingPrefill=null; activeTab='sales'; salesMode='form'; renderTabs(); toast('Open Sales and re-enter this invoice'); }
   else { toast('Open the matching tab to re-enter'); }
 }
@@ -2730,7 +3087,7 @@ function rpTableFromPnLPack(res){
       ['NET SALES', ns],
       ['Add: Complimentary Income (billed at 0%)', inc.compIncome],
       ['Add: Staff Food Income', inc.staffFoodIncome],
-      ['Add: Returns (added back)', inc.returnsAddBack],
+      ['Add: Closing Stock at Departments (netted off consumption)', inc.returnsAddBack],
       ['TOTAL NET INCOME (A)', inc.totalNetIncome]
     ])});
 
@@ -2739,6 +3096,7 @@ function rpTableFromPnLPack(res){
      that is the correction, not a discrepancy. */
   var bLines=[
     ['Consumption — Food, Beverage & Stores', dir.consumption],
+    ['Add: Opening Stock at Departments', dir.openingStock],
     ['Zomato Commission', dir.zomatoComm],
     ['Swiggy Commission', dir.swiggyComm],
     ['Zomato GST', dir.zomatoGST],
@@ -2846,26 +3204,26 @@ function rpTableFromPnLPack(res){
   S.push({ title:'ANNEXURE 2 | SALES BY PAYMENT MODE (gross)',
     headers:['Payment Mode','Amount (Rs.)','% of Gross Sale'], rows:a2 });
 
-  var t3=[0,0,0,0];
+  var t3=[0,0,0,0,0];
   var a3=(res.a3||[]).map(function(r){
-    t3[0]+=r.revenue||0; t3[1]+=r.consumption||0; t3[2]+=r.ret||0; t3[3]+=r.grossProfit||0;
-    return [r.dept, rpNum(r.revenue), rpNum(r.consumption), rpNum(r.ret), rpNum(r.grossProfit)]; });
-  a3.push(['Total', rpNum(t3[0]), rpNum(t3[1]), rpNum(t3[2]), rpNum(t3[3])]);
+    t3[0]+=r.revenue||0; t3[1]+=r.consumption||0; t3[2]+=r.opn||0; t3[3]+=r.ret||0; t3[4]+=r.grossProfit||0;
+    return [r.dept, rpNum(r.revenue), rpNum(r.consumption), rpNum(r.opn), rpNum(r.ret), rpNum(r.grossProfit)]; });
+  a3.push(['Total', rpNum(t3[0]), rpNum(t3[1]), rpNum(t3[2]), rpNum(t3[3]), rpNum(t3[4])]);
   S.push({ title:'ANNEXURE 3 | DEPARTMENT-WISE GROSS PROFIT',
-    headers:['Department','Revenue (Rs.)','Consumption (Rs.)','Return (Rs.)','Gross Profit (Rs.)'], rows:a3 });
+    headers:['Department','Revenue (Rs.)','Consumption (Rs.)','Opening (Rs.)','Closing (Rs.)','Gross Profit (Rs.)'], rows:a3 });
 
   /* % is taken on ISSUE, not on net. Consumption in this P&L is gross issue
      value, so basing the mix on anything else gives percentages that cannot be
      tied back to the consumption figure in section B. Spoilage is shown but
      excluded from Net, because the P&L excludes it too \u2014 it is a memo item. */
-  var t4i=0,t4r=0,t4s=0; (res.a4||[]).forEach(function(r){ t4i+=r.iss||0; t4r+=r.ret||0; t4s+=r.spo||0; });
+  var t4i=0,t4r=0,t4s=0,t4o=0; (res.a4||[]).forEach(function(r){ t4i+=r.iss||0; t4r+=r.ret||0; t4s+=r.spo||0; t4o+=r.opn||0; });
   var a4=(res.a4||[]).map(function(r){
-    return [r.category, rpNum(r.iss), rpNum(r.ret), rpNum(r.spo),
-            rpNum((r.iss||0)-(r.ret||0)),
+    return [r.category, rpNum(r.iss), rpNum(r.opn), rpNum(r.ret), rpNum(r.spo),
+            rpNum((r.iss||0)+(r.opn||0)-(r.ret||0)),
             t4i>0?rpP((r.iss||0)/t4i):'\u2014']; });
-  a4.push(['Total', rpNum(t4i), rpNum(t4r), rpNum(t4s), rpNum(t4i-t4r), t4i>0?'100.00%':'\u2014']);
+  a4.push(['Total', rpNum(t4i), rpNum(t4o), rpNum(t4r), rpNum(t4s), rpNum(t4i+t4o-t4r), t4i>0?'100.00%':'\u2014']);
   S.push({ title:'ANNEXURE 4 | CONSUMPTION BY CATEGORY',
-    headers:['Category','Issue (Rs.)','Return (Rs.)','Spoilage (Rs.)','Net of Returns (Rs.)','% of Issue'], rows:a4 });
+    headers:['Category','Issue (Rs.)','Opening (Rs.)','Closing (Rs.)','Spoilage (Rs.)','Net Consumption (Rs.)','% of Issue'], rows:a4 });
 
   /* A tolerance of one rupee, not zero: FIFO rates carry more decimal places
      than the archive stores, so an exact-zero test would flag healthy periods. */
@@ -3218,6 +3576,17 @@ var ISSUE_FIELDS=[
 ];
 var PURCHASE_IMPORT={ noun:'purchases',            fields:PURCHASE_FIELDS, action:'processPurchases', groupBy:['date','bill'] };
 var ISSUE_IMPORT   ={ noun:'issues / consumption', fields:ISSUE_FIELDS,    action:'processIssues',    groupBy:['date','dept'] };
+/* impSubmit builds each row as cfg.fields.map(...), so this ORDER is the wire
+   format. processReturns destructures [dt, dept, item, qty, notes] — reordering
+   these keys silently sends a department where a date is expected. */
+var RETURN_FIELDS=[
+  {k:'date', label:'Count date',  req:true,  aliases:['date','countdate','closingdate','returndate','asondate']},
+  {k:'dept', label:'Department',  req:true,  aliases:['department','dept','section']},
+  {k:'item', label:'Item',        req:true,  aliases:['item','itemname','product','particulars']},
+  {k:'qty',  label:'Qty on hand', req:true,  aliases:['qty','quantity','qnty','closing','closingqty','balance','onhand','nos']},
+  {k:'notes',label:'Notes',       req:false, aliases:['notes','remark','remarks','narration']}
+];
+var RETURN_IMPORT  ={ noun:'returns / closing stock', fields:RETURN_FIELDS,   action:'processReturns',   groupBy:['date','dept'] };
 var _impState={};
 function impAutoMap(headers, fields){
   var norm=headers.map(sNorm), used={}, map={};
@@ -4372,26 +4741,48 @@ function submitRequirement(){
     optDone(chip, res.reqId+(editing?' updated':' raised')+' \u00b7 '+res.lines+' item(s)');
     toast(res.reqId+(editing?' updated':' raised'));
     if(activeTab==='requirements' && rqMode==='list') loadReqList();
+    /* Every successful entry refreshes the reminder immediately, so the raiser
+       sees it land. Other devices pick it up on their next foreground or poll —
+       without push there is no way to reach a phone that is not looking. */
+    reqAlertTick(true);
   }).catch(function(e){
     optFail(chip, 'Not saved: '+((e&&e.message)||'connection failed'));
     toast((e&&e.message)||'Connection failed', true);
   });
 }
+/* ensureItems is cached, so wrapping the list in it costs nothing after the first
+   call and is what makes a real department list available for the filter. */
 function loadReqList(){
-  $('rqBody').innerHTML='<div class="stkctl">'+
-      '<div class="field"><label>Status</label><select id="qFStat">'+
-      '<option value="PENDING">Pending (Open + Partial)</option><option value="">All</option>'+
-      '<option value="Open">Open</option><option value="Partial">Partial</option>'+
-      '<option value="Issued">Issued</option><option value="Cancelled">Cancelled</option></select></div>'+
-      '<div class="field"><label>&nbsp;</label><button class="btn secondary small" id="qRef">Refresh</button></div></div>'+
-    '<div id="qList"><div class="stub">Loading\u2026</div></div>';
-  $('qFStat').onchange=fetchReqs; $('qRef').onclick=fetchReqs;
-  fetchReqs();
+  $('rqBody').innerHTML='<div class="stub">Loading\u2026</div>';
+  ensureItems(function(){
+    var deptOpts=(_itemsCache.departments||[]).map(function(d){
+      return '<option value="'+esc(d)+'">'+esc(d)+'</option>'; }).join('');
+    $('rqBody').innerHTML='<div class="stkctl">'+
+        '<div class="field"><label>Status</label><select id="qFStat">'+
+        '<option value="PENDING">Pending (Open + Partial)</option><option value="">All</option>'+
+        '<option value="Open">Open</option><option value="Partial">Partial</option>'+
+        '<option value="Issued">Issued</option><option value="Cancelled">Cancelled</option></select></div>'+
+        '<div class="field"><label>Department</label><select id="qFDept">'+
+        '<option value="">All departments</option>'+deptOpts+'</select></div>'+
+        '<div class="field"><label>&nbsp;</label><button class="btn secondary small" id="qRef">Refresh</button></div></div>'+
+      '<div id="qList"><div class="stub">Loading\u2026</div></div>';
+    if($('qFDept') && _rqDeptFilter) $('qFDept').value=_rqDeptFilter;
+    $('qFStat').onchange=fetchReqs;
+    $('qFDept').onchange=fetchReqs;
+    $('qRef').onclick=fetchReqs;
+    fetchReqs();
+  });
 }
+/* Remembered across rebuilds: loadReqList runs again after every cancel and after
+   a fresh entry, and silently resetting the filter to All each time would be a
+   small betrayal on a long list. */
+var _rqDeptFilter='';
 function fetchReqs(){
   var st=$('qFStat')?$('qFStat').value:'PENDING';
+  var dp=$('qFDept')?$('qFDept').value:'';
+  _rqDeptFilter=dp;
   $('qList').innerHTML='<div class="stub">Loading\u2026</div>';
-  api('listRequirements',{status:st}).then(function(res){
+  api('listRequirements',{status:st, department:dp}).then(function(res){
     if(!res.ok){ $('qList').innerHTML='<div class="msg err">'+esc(res.error||'Failed')+'</div>'; return; }
     if(!res.reqs.length){ $('qList').innerHTML='<div class="stub">Nothing here.</div>'; return; }
     $('qList').innerHTML=res.reqs.map(function(q){
