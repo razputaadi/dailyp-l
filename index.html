@@ -3072,8 +3072,13 @@ function rpTableFromPnLPack(res){
   var ns=inc.netSales||0;
   var S=[];
 
+ /* Total Income, not Net Sales: with closing stock netted off consumption and
+     comp / staff-food added back, Net Sales alone no longer describes what the
+     period actually earned. `ns` stays the percentage base below — a cost read as
+     a share of Net Sales is the industry-standard ratio and changing that would
+     silently redefine every Food Cost % ever compared. */
   S.push({ title:'PERIOD AT A GLANCE', headers:['Measure','Value'], rows:[
-    ['Net Sales', rpNum(ns)],
+    ['Total Income', rpNum(inc.totalNetIncome)],
     ['Gross Profit / (Loss)', rpNum(P.grossProfit)],
     ['Net Profit / (Loss)', rpNum(P.netProfit)],
     ['Net Profit Margin', rpP(P.netProfitMargin)],
