@@ -338,10 +338,11 @@
 
   /* ── management pack presentation (also what the PDF captures) ── */
   table.rptbl td:not(:first-child), table.rptbl th:not(:first-child){ text-align:right }
-  table.rptbl tbody tr:nth-child(even) td{ background:#FAFBFA }
-  table.rptbl tbody tr:nth-child(even) td.rpneg{ background:#FAFBFA }
-  table.rptbl tr.rphi td, table.rptbl tr.rpgrand td, table.rptbl tr.rpsub td,
-  table.rptbl tr.rpdiv td, table.rptbl tr.rpwarn td{ background-image:none }
+  /* Zebra must NOT touch rows that paint their own background. An unqualified
+     nth-child rule scores (0,2,4) against tr.rphi at (0,2,3), so it wins and
+     repaints a dark-green highlight row near-white while its text stays white —
+     the row goes invisible. Excluding those classes fixes it without !important. */
+  table.rptbl tbody tr:nth-child(even):not(.rphi):not(.rpgrand):not(.rpsub):not(.rpdiv):not(.rpwarn) td{ background:#FAFBFA }
   table.rptbl tr.rphi td{ font-size:13px; letter-spacing:.01em }
   table.rptbl tr.rpstock td{ color:var(--muted); font-style:italic }
   table.rptbl tr.rpstock td:first-child{ padding-left:22px }
@@ -3360,58 +3361,70 @@ function rpTableFromPnLPack(res){
   return { sections:S };
 }
 
-function rpTableFromFoodCost(res){
-  var P=res.period||{}, f=P.food||{};
+/* Food & Beverage Cost — three blocks from ONE server call.
+   _wsGetFoodCostReport already returns the whole period object, so P.food and
+   P.bev both arrive together; a combined view needs no extra archive read and
+   cannot disagree with either half. */
+function rpTableFromFbCost(res){
+  var P=res.period||{}, f=P.food||{}, b=P.bev||{}, inc=P.income||{};
+  var days=P.days||1;
+
+  var cSales=(f.totalSales||0)+(b.totalSales||0);
+  var cCost =(f.cost||0)+(b.cost||0);
+
   return { sections:[
+    { title:'COMBINED \u2014 FOOD & BEVERAGE', headers:['Particulars','Amount (Rs.)'], rows:[
+      ['Food Total Sales', rpNum(f.totalSales)],
+      ['Beverage Total Sales', rpNum(b.totalSales)],
+      ['Total Sales (Food + Beverage)', rpNum(cSales)],
+      ['Food Cost', rpNum(f.cost)],
+      ['Cost of Beverages', rpNum(b.cost)],
+      ['TOTAL COST (Food + Beverage)', rpNum(cCost)],
+      ['Combined Cost %', rpP(cSales>0?(cCost/cSales):0)],
+      ['Combined Cost per Day', rpNum(cCost/days)]
+    ]},
+
     { title:'FOOD COST', headers:['Particulars','Amount (Rs.)'], rows:[
       ['Food Net Sales (excl. Beverages)', rpNum(f.netSales)],
       ['Income From Comp Sales (Food)', rpNum(f.compIncome)],
       ['Income From Staff Food', rpNum(f.staffFoodIncome)],
       ['Total Sales', rpNum(f.totalSales)],
       ['Food Cost', rpNum(f.cost)],
-      ['Food Cost %', rpP(f.costPct)]
+      ['Food Cost %', rpP(f.costPct)],
+      ['Food Cost per Day', rpNum((f.cost||0)/days)]
     ]},
-    { title:'CONTEXT', headers:['Measure','Value'], rows:[
-      ['Net Sales (all)', rpNum((P.income||{}).netSales)],
-      ['Food Cost % of total Net Sales', rpP(((P.income||{}).netSales>0)?(f.cost/(P.income||{}).netSales):0)],
-      ['Days in period', P.days||0],
-      ['Food Cost per Day', rpNum((f.cost||0)/(P.days||1))]
-    ]},
-    /* Printed so the number is auditable. A cost report whose definition is
-       invisible is a number nobody can check or challenge. */
-    { title:'DEFINITION — what is counted', headers:['Basis','Included'], rows:[
-      ['Departments (issue destination)', (res.depts||[]).join(', ')],
-      ['Item categories', (res.cats||[]).join(', ')],
-      ['Note','Spelling variants are listed deliberately: category matching is exact, so an unmerged duplicate in Item_Master would otherwise be dropped from cost.']
-    ]}
-  ]};
-}
 
-function rpTableFromBevCost(res){
-  var P=res.period||{}, b=P.bev||{};
-  return { sections:[
     { title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
       ['Beverages Sales (net)', rpNum(b.netSales)],
       ['Comp. Beverage Sale', rpNum(b.compIncome)],
       ['Total Beverage Sales', rpNum(b.totalSales)],
       ['Cost of Beverages', rpNum(b.cost)],
-      ['Beverage Cost %', rpP(b.costPct)]
+      ['Beverage Cost %', rpP(b.costPct)],
+      ['Beverage Cost per Day', rpNum((b.cost||0)/days)]
     ]},
+
     { title:'CONTEXT', headers:['Measure','Value'], rows:[
-      ['Net Sales (all)', rpNum((P.income||{}).netSales)],
-      ['Beverage share of Net Sales', rpP(((P.income||{}).netSales>0)?(b.netSales/(P.income||{}).netSales):0)],
-      ['Days in period', P.days||0],
-      ['Beverage Cost per Day', rpNum((b.cost||0)/(P.days||1))]
+      ['Net Sales (all)', rpNum(inc.netSales)],
+      ['Combined cost % of total Net Sales', rpP((inc.netSales>0)?(cCost/inc.netSales):0)],
+      ['Food share of Net Sales', rpP((inc.netSales>0)?((f.netSales||0)/inc.netSales):0)],
+      ['Beverage share of Net Sales', rpP((inc.netSales>0)?((b.netSales||0)/inc.netSales):0)],
+      ['Days in period', P.days||0]
     ]},
-    /* This caveat is the whole reason the number looks low. Stated on the report
-       itself, not buried in a handover doc. */
-    { title:'DEFINITION — read this before using the %', headers:['Basis','Included'], rows:[
-      ['Scope', res.note||''],
-      ['Departments (issue destination)', (res.depts||[]).join(', ')],
-      ['Item categories', (res.cats||[]).join(', ')]
+
+    /* Printed so the number is auditable. A cost report whose definition is
+       invisible is a number nobody can check or challenge. catsDisplay is the
+       de-duplicated list \u2014 the server still matches on every spelling
+       variant, but printing them was repetition, not information. */
+    { title:'DEFINITION \u2014 what is counted', headers:['Basis','Included'], rows:[
+      ['Food departments (issue destination)', (res.depts||[]).join(', ')],
+      ['Beverage departments (issue destination)', (res.bevDepts||[]).join(', ')],
+      ['Item categories (both)', ((res.catsDisplay&&res.catsDisplay.length)?res.catsDisplay:(res.cats||[])).join(', ')],
+      ['\u26a0 Beverage scope', res.bevNote||res.note||''],
+      ['Excluded', 'Banquet departments, transfer departments, and any category outside the list above \u2014 so Food + Beverage will always be less than total consumption.']
     ]}
   ]};
 }
+
 
 function rpTableFromFullPnL(res){
   var sections=[{ title:'P&L Statement', headers:['Line','Amount'], rows:rpPnlStatement(res.topline||{}) }];
@@ -3453,10 +3466,12 @@ var REPORTS=[
      inputs:['range',{k:'target',label:'Break-even target consumption %',kind:'text',ph:'35'}],
      run:function(p){ _rpBeTarget=parseFloat(p.target)||35; return api('getPnLPack',{fromKey:p.from,toKey:p.to}); },
      table:rpTableFromPnLPack},
-  {id:'foodcost',  label:'Food Cost report',                  cap:'Report: Food Cost',      compare:true, inputs:['range'],
-     run:function(p){ return api('getFoodCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromFoodCost},
-  {id:'bevcost',   label:'Beverage Cost report',              cap:'Report: Beverage Cost',  compare:true, inputs:['range'],
-     run:function(p){ return api('getBeverageCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromBevCost},
+  /* One report, three blocks. Kept on the getFoodCostReport action and the
+     'Report: Food Cost' capability so no new gateway route, capability row or
+     permission is needed \u2014 the 'Report: Beverage Cost' capability simply
+     goes unused. */
+  {id:'fbcost',    label:'Food & Beverage Cost report',       cap:'Report: Food Cost',      compare:true, inputs:['range'],
+     run:function(p){ return api('getFoodCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromFbCost},
   {id:'stockmove', label:'Stock movement (Open/Purch/Issued/Close)', cap:'Report: Stock Movement', inputs:['range'], run:function(p){ return api('getStockReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromStockReport},
   {id:'livestock', label:'Live stock (on hand now)',         cap:'Report: Live Stock',     inputs:[],        run:function(p){ return api('getStockStatus'); }, table:rpTableFromLiveStock},
   {id:'stockitem', label:'Stock Item Analysis (Purchase/Issue/Return)', cap:'Report: Stock Item Analysis', inputs:['range',{k:'type',label:'Type',kind:'select',options:[['purchase','Purchase'],['issue','Issue'],['return','Return'],['fifolayers','FIFO layers']]},{k:'category',label:'Category (optional)',kind:'text',list:'rpCatList',ph:'All'},{k:'item',label:'Item (optional)',kind:'text',list:'rpItemList',ph:'All'}], run:function(p){
