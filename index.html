@@ -336,6 +336,23 @@
   table.rptbl tr.rpdiv td{ background:#F4F7F5; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:10px; font-family:var(--ui) }
   table.rptbl td.rpneg{ color:#C0392B }
 
+  /* ── management pack presentation (also what the PDF captures) ── */
+  table.rptbl td:not(:first-child), table.rptbl th:not(:first-child){ text-align:right }
+  table.rptbl tbody tr:nth-child(even) td{ background:#FAFBFA }
+  table.rptbl tbody tr:nth-child(even) td.rpneg{ background:#FAFBFA }
+  table.rptbl tr.rphi td, table.rptbl tr.rpgrand td, table.rptbl tr.rpsub td,
+  table.rptbl tr.rpdiv td, table.rptbl tr.rpwarn td{ background-image:none }
+  table.rptbl tr.rphi td{ font-size:13px; letter-spacing:.01em }
+  table.rptbl tr.rpstock td{ color:var(--muted); font-style:italic }
+  table.rptbl tr.rpstock td:first-child{ padding-left:22px }
+  table.rptbl tr.rpwarn td{ background:#FFF6E5; color:#8A5A00; font-weight:600;
+    text-align:left; white-space:normal; font-family:var(--ui); font-size:11px }
+  table.rptbl tr.rphi td:first-child, table.rptbl tr.rpgrand td:first-child{ font-weight:700 }
+  .rpsecttitle{ margin-top:20px }
+  .rpsect:first-child .rpsecttitle{ margin-top:4px }
+  .rpsect{ break-inside:avoid; page-break-inside:avoid }
+  .matrix-wrap{ background:var(--surface) }
+
   /* toast */
   #toast{position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(8px);
     background:var(--ink); color:#fff; padding:11px 16px; border-radius:999px; font-size:13px; font-weight:500;
@@ -2974,25 +2991,117 @@ function rpExportJpeg(){
     toast('JPEG downloaded');
   });
 }
+/* PDF export, paginated on SECTION boundaries.
+   The old version captured the whole report as one canvas and cut it at fixed
+   pixel heights, which sliced table rows and section titles in half. This
+   captures each .rpsect separately and starts a new page when the next section
+   will not fit, so a section is never split unless it is taller than a page on
+   its own \u2014 and only that section is sliced, never its neighbours.
+
+   The header and footer are drawn as jsPDF TEXT, not captured pixels, so they
+   stay crisp at any zoom and cost nothing in file size.
+
+   All sections are scaled by ONE common factor derived from the widest block, so
+   type size is identical throughout instead of each table being fitted to width
+   independently. */
 function rpExportPdf(){
-  rpCapture(function(canvas){
+  var body=$('rpBody');
+  if(!body){ return; }
+  var blocks=body.querySelectorAll('.rpsect');
+  if(!blocks.length){ blocks=body.querySelectorAll('.matrix-wrap'); }
+  if(!blocks.length){ toast('Nothing to export', true); return; }
+  blocks=Array.prototype.slice.call(blocks);
+
+  toast('Preparing PDF\u2026');
+  _libExport().then(function(){
     var JS=(window.jspdf&&window.jspdf.jsPDF)||window.jsPDF;
-    if(!JS){ toast('PDF tool not loaded — try again', true); return; }
-    var pdf=new JS({orientation: canvas.width>canvas.height?'l':'p', unit:'pt', format:'a4'});
+    if(!JS){ toast('PDF tool not loaded \u2014 try again', true); return; }
+
+    var pdf=new JS({orientation:'p', unit:'pt', format:'a4'});
     var pw=pdf.internal.pageSize.getWidth(), ph=pdf.internal.pageSize.getHeight();
-    var margin=20, iw=pw-margin*2, ratio=iw/canvas.width;
-    var pageCanvasH=(ph-margin*2)/ratio, remaining=canvas.height, sy=0, first=true;
-    while(remaining>0){
-      var sh=Math.min(pageCanvasH, remaining);
-      var slice=document.createElement('canvas'); slice.width=canvas.width; slice.height=sh;
-      slice.getContext('2d').drawImage(canvas, 0, sy, canvas.width, sh, 0, 0, canvas.width, sh);
-      if(!first) pdf.addPage();
-      pdf.addImage(slice.toDataURL('image/jpeg',0.92), 'JPEG', margin, margin, iw, sh*ratio);
-      remaining-=sh; sy+=sh; first=false;
+    var M=34, cw=pw-M*2;
+    var SCALE=2;
+    var baseW=0;
+    blocks.forEach(function(b){ baseW=Math.max(baseW, b.scrollWidth); });
+    if(!baseW) baseW=body.scrollWidth||600;
+    var f=cw/(baseW*SCALE);          // one common canvas->pt factor
+
+    var venue='';
+    try { venue=(state&&state.me&&state.me.venue)?venueDisplay(state.me.venue):''; } catch(e){}
+
+    function headerPage1(){
+      pdf.setFont('helvetica','bold'); pdf.setFontSize(15); pdf.setTextColor(15,92,74);
+      pdf.text(String(_rpLabel||'Report'), M, M+14);
+      pdf.setFont('helvetica','normal'); pdf.setFontSize(9.5); pdf.setTextColor(92,107,102);
+      var l2=[];
+      if(venue) l2.push(venue);
+      if(_rpPeriod) l2.push(String(_rpPeriod));
+      pdf.text(l2.join('   \u00b7   '), M, M+30);
+      pdf.setFontSize(8); pdf.setTextColor(140,150,146);
+      pdf.text('Generated '+todayStr()+'   \u00b7   build '+String(APP_BUILD), M, M+43);
+      pdf.setDrawColor(220,226,222); pdf.setLineWidth(0.8);
+      pdf.line(M, M+50, pw-M, M+50);
+      return M+62;
     }
-    pdf.save(rpFileName('pdf'));
-    toast('PDF downloaded');
-  });
+    function headerCont(){
+      pdf.setFont('helvetica','normal'); pdf.setFontSize(8); pdf.setTextColor(140,150,146);
+      pdf.text(String(_rpLabel||'Report')+(venue?('  \u00b7  '+venue):''), M, M+8);
+      pdf.setDrawColor(233,237,234); pdf.setLineWidth(0.6);
+      pdf.line(M, M+14, pw-M, M+14);
+      return M+24;
+    }
+
+    var y=headerPage1();
+    var bottom=ph-M-16;
+
+    /* .matrix-wrap clips horizontally on screen; html2canvas would inherit the
+       clip and cut the right-hand columns. Unclip for the capture, restore after. */
+    var wraps=body.querySelectorAll('.matrix-wrap'), saved=[];
+    Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
+    function restore(){ Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; }); }
+
+    function step(i){
+      if(i>=blocks.length){
+        restore();
+        var n=pdf.getNumberOfPages();
+        for(var p=1;p<=n;p++){
+          pdf.setPage(p);
+          pdf.setFont('helvetica','normal'); pdf.setFontSize(8); pdf.setTextColor(150,158,154);
+          pdf.text('Page '+p+' of '+n, pw-M, ph-M+4, {align:'right'});
+        }
+        pdf.save(rpFileName('pdf'));
+        toast('PDF downloaded');
+        return;
+      }
+      html2canvas(blocks[i], {scale:SCALE, backgroundColor:'#ffffff', windowWidth:baseW+40})
+      .then(function(c){
+        var dw=c.width*f, dh=c.height*f;
+
+        if(dh>(ph-M*2-24)){
+          /* Taller than a whole page on its own: this one section is sliced, and
+             only this one. Neighbours are unaffected. */
+          if(y>M+70){ pdf.addPage(); y=headerCont(); }
+          var remaining=c.height, sy=0;
+          while(remaining>0){
+            var availPt=bottom-y;
+            if(availPt<40){ pdf.addPage(); y=headerCont(); availPt=bottom-y; }
+            var sh=Math.min(Math.floor(availPt/f), remaining);
+            var sl=document.createElement('canvas'); sl.width=c.width; sl.height=sh;
+            sl.getContext('2d').drawImage(c, 0, sy, c.width, sh, 0, 0, c.width, sh);
+            pdf.addImage(sl.toDataURL('image/jpeg',0.94),'JPEG', M, y, dw, sh*f);
+            y+=sh*f+6; remaining-=sh; sy+=sh;
+          }
+        } else {
+          if(y+dh>bottom){ pdf.addPage(); y=headerCont(); }
+          pdf.addImage(c.toDataURL('image/jpeg',0.94),'JPEG', M, y, dw, dh);
+          y+=dh+12;
+        }
+        step(i+1);
+      })
+      .catch(function(){ restore(); toast('Could not render the report', true); });
+    }
+    step(0);
+  }).catch(function(e){ toast((e&&e.message)||'Export tools failed to load', true); });
 }
 function rpMonthStart(){ var d=new Date(); return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-01'; }
 function rpTableFromHeadersRows(res){ return { headers:(res.headers||[]), rows:(res.rows||[]) }; }
@@ -3072,13 +3181,24 @@ function rpTableFromPnLPack(res){
   var ns=inc.netSales||0;
   var S=[];
 
- /* Total Income, not Net Sales: with closing stock netted off consumption and
-     comp / staff-food added back, Net Sales alone no longer describes what the
-     period actually earned. `ns` stays the percentage base below — a cost read as
-     a share of Net Sales is the industry-standard ratio and changing that would
-     silently redefine every Food Cost % ever compared. */
+  /* TOTAL INCOME excludes the department closing balance. Closing stock is not
+     income \u2014 it is unconsumed cost, so it sits in section B as a NEGATIVE
+     directly under Opening Stock. Arithmetically neutral: A loses it, B gains it
+     as a deduction, so Gross Profit is unchanged. What DOES change is the
+     percentage base \u2014 sections B and C, the KPIs, break-even and the memo are
+     all read against Total Income now. Section A keeps Net Sales as its base
+     because NET SALES is the 100% line there.
+
+     Note this reverses the v21 decision to hold Net Sales as the base. Total
+     Income includes Complimentary Income and Staff Food, neither of which became
+     cash, so every cost ratio reads lower against it than against Net Sales and
+     break-even reads nearer. Deliberate, per the reporting structure. */
+  var ti   = (inc.totalNetIncome||0) - (inc.returnsAddBack||0);
+  var bTot = (dir.total||0) - (inc.returnsAddBack||0);
+  var pctTI = function(a){ return ti>0 ? rpP(a/ti) : '\u2014'; };
+
   S.push({ title:'PERIOD AT A GLANCE', headers:['Measure','Value'], rows:[
-    ['Total Income', rpNum(inc.totalNetIncome)],
+    ['Total Income', rpNum(ti)],
     ['Gross Profit / (Loss)', rpNum(P.grossProfit)],
     ['Net Profit / (Loss)', rpNum(P.netProfit)],
     ['Net Profit Margin', rpP(P.netProfitMargin)],
@@ -3092,16 +3212,13 @@ function rpTableFromPnLPack(res){
       ['NET SALES', ns],
       ['Add: Complimentary Income (billed at 0%)', inc.compIncome],
       ['Add: Staff Food Income', inc.staffFoodIncome],
-      ['Add: Closing Stock at Departments (netted off consumption)', inc.returnsAddBack],
-      ['TOTAL NET INCOME (A)', inc.totalNetIncome]
+      ['TOTAL INCOME (A)', ti]
     ])});
 
-  /* DE-typed expense heads are itemised individually. They belong above gross
-     profit, and if any exist the total will not match the old cockpit figure —
-     that is the correction, not a discrepancy. */
   var bLines=[
-    ['Consumption — Food, Beverage & Stores', dir.consumption],
+    ['Consumption \u2014 Food, Beverage & Stores', dir.consumption],
     ['Add: Opening Stock at Departments', dir.openingStock],
+    ['Less: Closing Stock at Departments', -(inc.returnsAddBack||0)],
     ['Zomato Commission', dir.zomatoComm],
     ['Swiggy Commission', dir.swiggyComm],
     ['Zomato GST', dir.zomatoGST],
@@ -3109,87 +3226,86 @@ function rpTableFromPnLPack(res){
     ['Zomato Advertisement', dir.zomatoAds],
     ['Swiggy Advertisement', dir.swiggyAds]
   ];
-  (dir.deHeads||[]).forEach(function(h){ bLines.push(['Direct expense — '+h.head, h.amount]); });
-  bLines.push(['TOTAL DIRECT EXPENSES (B)', dir.total]);
+  (dir.deHeads||[]).forEach(function(h){ bLines.push(['Direct expense \u2014 '+h.head, h.amount]); });
+  bLines.push(['TOTAL DIRECT EXPENSES (B)', bTot]);
   S.push({ title:'B. DIRECT EXPENSES (variable cost of sales)',
-    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, bLines) });
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, bLines) });
 
   S.push({ title:'GROSS PROFIT (A - B)', headers:['Measure','Value'], rows:[
-    ['Consumption % of Net Sales', rpP(dir.consPctNetSales)],
+    ['Consumption % of Total Income', pctTI(dir.consumption)],
     ['GROSS PROFIT (A - B)', rpNum(P.grossProfit)],
     ['Gross Profit Margin (on Net Sales)', rpP(P.grossProfitPct)]
   ]});
 
   var cLines=[['Fixed Expenses', ind.fixed]];
-  (ind.otherHeads||[]).forEach(function(h){ cLines.push(['Other — '+h.head, h.amount]); });
+  (ind.otherHeads||[]).forEach(function(h){ cLines.push(['Other \u2014 '+h.head, h.amount]); });
   cLines.push(['Other Expenses (total)', ind.other]);
   cLines.push(['TOTAL INDIRECT EXPENSES (C)', ind.total]);
   S.push({ title:'C. INDIRECT EXPENSES (fixed / period costs)',
-    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, cLines) });
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, cLines) });
 
   S.push({ title:'NET PROFIT / (LOSS) (A - B - C)', headers:['Measure','Value'], rows:[
     ['NET PROFIT / (LOSS)', rpNum(P.netProfit)],
     ['Net Profit Margin (on Net Sales)', rpP(P.netProfitMargin)]
   ]});
 
+  /* KPI percentages are recomputed here from the payload's AMOUNTS rather than
+     from the server's pre-computed *Pct fields, which are all Net-Sales based.
+     Recomputing locally keeps this a front-end-only change \u2014 no redeploy. */
   S.push({ title:'KEY PERFORMANCE INDICATORS', headers:['Indicator','Value'], rows:[
     ['Gross Sale per Day', rpNum(k.grossSalePerDay)],
     ['Net Sales per Day', rpNum(k.netSalesPerDay)],
-    ['Consumption % of Net Sales', rpP(k.consPct)],
-    ['Direct Expense % of Net Sales', rpP(k.directPct)],
+    ['Consumption % of Total Income', pctTI(dir.consumption)],
+    ['Direct Expense % of Total Income', pctTI(bTot)],
     ['Fixed Expense per Day', rpNum(k.fixedPerDay)],
-    ['Fixed Expense % of Net Sales', rpP(k.fixedPct)],
+    ['Fixed Expense % of Total Income', pctTI(ind.fixed)],
     ['Aggregator Sale (Zomato + Swiggy, gross)', rpNum(k.aggSale)],
     ['Aggregator Cost (commission + GST + ads)', rpNum(k.aggCost)],
     ['Aggregator Cost % of Aggregator Sale', rpP(k.aggCostPctAggSale)],
     ['Discount % of Gross Sale', rpP(k.discountPctGross)],
-    ['Complimentary Sale % of Net Sales', rpP(k.compPctNetSales)],
-    ['Contribution per Rs. 1 of Net Sales', rpNum(k.contributionPerRupee)]
+    ['Complimentary Sale % of Total Income', pctTI(memo.compSale)]
   ]});
 
-  /* BREAK-EVEN. Deliberately reports impossibility rather than printing a
-     meaningless number: once target cost plus actual aggregator cost reaches
-     100% of net sales the contribution margin is nil or negative, and every
-     additional rupee of sale increases the loss. Dividing by that would produce
-     a confident-looking figure with no meaning. */
+  /* BREAK-EVEN, on the Total Income base. otherDirectPct is recomputed because
+     be.otherDirectPct is Net-Sales based: the aggregator + DE amount is B's
+     total less the two stock lines. The contribution-margin figures are still
+     COMPUTED \u2014 break-even divides by them \u2014 they are simply no longer
+     printed. The two warnings depend on them and are kept, because reporting
+     impossibility beats printing a confident number with no meaning. */
   var tgt=(parseFloat(_rpBeTarget)||0)/100;
-  var odp=be.otherDirectPct||0, cm=1-tgt-odp;
+  var otherDirectAmt=(dir.total||0)-(dir.consumption||0)-(dir.openingStock||0);
+  var odp = ti>0 ? (otherDirectAmt/ti) : 0;
+  var consPctTI = ti>0 ? ((dir.consumption||0)/ti) : 0;
+  var cm=1-tgt-odp, cmAct=1-consPctTI-odp;
   var fpo=be.fixedPlusOther||0, days=be.days||1;
-  var cmAct=1-(dir.consPctNetSales||0)-odp;
   var beRows=[
-    ['Target Consumption % of Net Sales (assumption)', rpP(tgt)],
-    ['Actual Consumption % of Net Sales', rpP(dir.consPctNetSales)],
-    ['Aggregator & other direct cost % of Net Sales (actual)', rpP(odp)],
-    ['Contribution Margin % at target cost structure', rpP(cm)],
-    /* The margin at ACTUAL cost, not just at target. This is the line that tells
-       you whether selling more currently helps or hurts \u2014 the single most
-       important number on the page, and the one a target-only block hides. */
-    ['Contribution Margin % at ACTUAL cost structure', rpP(cmAct)],
-    ['Fixed + Other expenses as % of Net Sales', rpP(ns>0?(fpo/ns):0)]
+    ['Target Consumption % of Total Income (assumption)', rpP(tgt)],
+    ['Actual Consumption % of Total Income', rpP(consPctTI)],
+    ['Aggregator & other direct cost % of Total Income (actual)', rpP(odp)],
+    ['Fixed + Other expenses as % of Total Income', pctTI(fpo)]
   ];
   if(cmAct<=0){
     beRows.push(['\u26a0 At actual cost',
       'Contribution margin is nil or negative, so every additional rupee of sale increases the loss. Volume alone cannot fix this \u2014 cost % must come down too.']);
   }
-  if(ns>0 && fpo>ns){
+  if(ti>0 && fpo>ti){
     beRows.push(['\u26a0 Fixed cost',
-      'Fixed and other period costs alone exceed Net Sales, so break-even is unattainable at this volume even at zero food cost.']);
+      'Fixed and other period costs alone exceed Total Income, so break-even is unattainable at this volume even at zero food cost.']);
   }
   if(cm>0){
     var beSales=fpo/cm;
-    beRows.push(['Break-even Net Sales required for the period', rpNum(beSales)]);
-    beRows.push(['Break-even Net Sales required per Day', rpNum(beSales/days)]);
-    beRows.push(['Gap vs. Actual Net Sales (shortfall)', rpNum(beSales-ns)]);
-    beRows.push(['Times current Net Sales needed to break even', ns>0?rpN2(beSales/ns):'\u2014']);
+    beRows.push(['Break-even Total Income required for the period', rpNum(beSales)]);
+    beRows.push(['Break-even Total Income required per Day', rpNum(beSales/days)]);
+    beRows.push(['Gap vs. Actual Total Income (shortfall)', rpNum(beSales-ti)]);
   } else {
-    beRows.push(['Break-even Net Sales required for the period','Not attainable']);
-    beRows.push(['Why','Contribution margin is nil or negative at this cost structure — every additional rupee of sale increases the loss. Cost % and volume must move together.']);
+    beRows.push(['Break-even Total Income required for the period','Not attainable']);
+    beRows.push(['Why','Contribution margin is nil or negative at this cost structure \u2014 every additional rupee of sale increases the loss. Cost % and volume must move together.']);
   }
   S.push({ title:'BREAK-EVEN ANALYSIS (change the target % above and re-run)',
     headers:['Particulars','Amount / %'], rows:beRows });
 
   S.push({ title:'MEMO / INFORMATION ITEMS (not charged to the P&L above)',
-    headers:['Particulars','Amount (Rs.)','% of Net Sales'], rows: rpPnlRows(ns, [
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, [
       ['Discount Given', memo.discount],
       ['Complimentary Sale (net value given free)', memo.compSale],
       ['Cancelled Sale', memo.cancelledSale],
@@ -3388,7 +3504,7 @@ var REPORTS=[
      run:function(p){ return api('getRequirementStatusReport',{fromKey:p.from,toKey:p.to,status:p.status||'',department:p.department||''}); }, table:rpTablePass}
 ];
 function rpAllowed(){ var c=state.me.caps||{}; return REPORTS.filter(function(r){ return !r.cap || c[r.cap]; }); }
-var _rpTable=null, _rpLabel='';
+var _rpTable=null, _rpLabel='', _rpPeriod='';
 function renderReports(m){
   var opts=rpAllowed().map(function(r){ return '<option value="'+r.id+'">'+esc(r.label)+'</option>'; }).join('');
   m.innerHTML='<div class="card"><h2>Reports</h2>'+
@@ -3460,7 +3576,7 @@ function rpRun(r){
   var btn=$('rpRun'); btn.disabled=true; var lbl=btn.textContent; btn.innerHTML='<span class="spin"></span>';
   var period = p.from ? (rpFmt(p.from)+' → '+rpFmt(p.to)) : '';
   var done=function(t, labelSuffix){
-    _rpTable=t; _rpLabel=r.label+(labelSuffix||'');
+    _rpTable=t; _rpLabel=r.label+(labelSuffix||''); _rpPeriod=period||'';
     var title='<div class="rptitle"><b>'+esc(r.label)+'</b>'+(period?('<span> · '+esc(period)+(doCmp?(' vs '+esc(rpFmt(cp.from))+' → '+esc(rpFmt(cp.to))):'')+'</span>'):'')+'</div>';
     var host=document.createElement('div'); rpRenderTableInto(host, t);
     $('rpBody').innerHTML=title+host.innerHTML;
@@ -3485,7 +3601,9 @@ function rpRun(r){
 function rpRenderTableInto(b, t){
   if(t.sections){
     if(!t.sections.length){ b.innerHTML='<div class="stub">No data.</div>'; return; }
-    b.innerHTML=t.sections.map(function(s){ return '<div class="rpsecttitle">'+esc(s.title)+'</div>'+rpOneTable(s.headers, s.rows); }).join('');
+    /* Each section wrapped in .rpsect so rpExportPdf can paginate on section
+       boundaries instead of slicing one tall canvas mid-row. */
+    b.innerHTML=t.sections.map(function(s){ return '<div class="rpsect"><div class="rpsecttitle">'+esc(s.title)+'</div>'+rpOneTable(s.headers, s.rows)+'</div>'; }).join('');
     return;
   }
   if(!t.rows||!t.rows.length){ b.innerHTML='<div class="stub">No data for this selection.</div>'; return; }
@@ -3498,13 +3616,35 @@ function rpFmt(v){
   if(mm) return mm[3]+'-'+mm[2]+'-'+mm[1];
   return s;
 }
+/* Row styling for the management pack. Matches the ACTUAL labels the P&L emits:
+   the old exact-match patterns (/^GROSS PROFIT$/) never fired against
+   'GROSS PROFIT (A - B)', which is why the report rendered flat. Ordered most
+   specific first \u2014 'Add:'/'Less:' is tested after the TOTAL patterns so a
+   subtotal is never demoted to a stock line. */
 function rpRowClass(first){
   var s=String(first||'').trim();
-  if(/^GROSS PROFIT$/i.test(s) || /^NET PROFIT$/i.test(s)) return 'rphi';
-  if(/^GRAND TOTAL$/i.test(s) || /^TOTAL$/i.test(s)) return 'rpgrand';
+  if(/^\u26a0/.test(s)) return 'rpwarn';
+  if(/^TOTAL INCOME \(A\)$/i.test(s)) return 'rphi';
+  if(/^GROSS PROFIT \(A - B\)$/i.test(s)) return 'rphi';
+  if(/^NET PROFIT \/ \(LOSS\)/.test(s)) return 'rphi';   // case-SENSITIVE: the title-case
+                                                        // 'Net Profit / (Loss)' in PERIOD AT A
+                                                        // GLANCE must stay unbannered
+  if(/^GROSS PROFIT as per P&L Statement$/i.test(s)) return 'rphi';
+  if(/^TOTAL (DIRECT|INDIRECT) EXPENSES/i.test(s)) return 'rpgrand';
+  if(/^NET SALES$/i.test(s)) return 'rpgrand';
+  if(/^(GRAND TOTAL|TOTAL|Total|Total Gross Sale|Total Collection)$/.test(s)) return 'rpgrand';
   if(/SUBTOTAL$/i.test(s)) return 'rpsub';
-  if(/^—.*—$/.test(s)) return 'rpdiv';
+  if(/^(Add:|Less:)/i.test(s)) return 'rpstock';
+  if(/^\u2014.*\u2014$/.test(s)) return 'rpdiv';
   return '';
+}
+/* rpneg used to require a numeric cell, but rpPnlRows pre-formats every figure
+   to a string, so no negative in the management pack was ever coloured. Detect a
+   formatted negative too \u2014 a digit is required after the sign so an em-dash
+   placeholder is never mistaken for one. */
+function rpIsNeg(c){
+  if(typeof c==='number') return c<0;
+  return /^\s*-\s*\d/.test(String(c==null?'':c));
 }
 function rpOneTable(headers, rows){
   var head='<tr>'+(headers||[]).map(function(h){ return '<th>'+esc(h)+'</th>'; }).join('')+'</tr>';
@@ -3512,7 +3652,7 @@ function rpOneTable(headers, rows){
     var cls=rpRowClass(r[0]);
     var cells=r.map(function(c,i){
       var v=rpFmt(c), cc='';
-      if(i>0 && typeof c==='number' && c<0) cc=' class="rpneg"';
+      if(i>0 && rpIsNeg(c)) cc=' class="rpneg"';
       return '<td'+cc+'>'+esc(v)+'</td>';
     }).join('');
     return '<tr'+(cls?(' class="'+cls+'"'):'')+'>'+cells+'</tr>';
@@ -3523,7 +3663,9 @@ function rpRenderTable(t){
   var b=$('rpBody');
   if(t.sections){
     if(!t.sections.length){ b.innerHTML='<div class="stub">No data.</div>'; return; }
-    b.innerHTML=t.sections.map(function(s){ return '<div class="rpsecttitle">'+esc(s.title)+'</div>'+rpOneTable(s.headers, s.rows); }).join('');
+    /* Each section wrapped in .rpsect so rpExportPdf can paginate on section
+       boundaries instead of slicing one tall canvas mid-row. */
+    b.innerHTML=t.sections.map(function(s){ return '<div class="rpsect"><div class="rpsecttitle">'+esc(s.title)+'</div>'+rpOneTable(s.headers, s.rows)+'</div>'; }).join('');
     return;
   }
   if(!t.rows||!t.rows.length){ b.innerHTML='<div class="stub">No data for this selection.</div>'; return; }
