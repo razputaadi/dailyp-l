@@ -342,13 +342,23 @@
      nth-child rule scores (0,2,4) against tr.rphi at (0,2,3), so it wins and
      repaints a dark-green highlight row near-white while its text stays white —
      the row goes invisible. Excluding those classes fixes it without !important. */
-  table.rptbl tbody tr:nth-child(even):not(.rphi):not(.rpgrand):not(.rpsub):not(.rpdiv):not(.rpwarn) td{ background:#FAFBFA }
-  table.rptbl tr.rphi td{ font-size:13px; letter-spacing:.01em }
+  table.rptbl tbody tr:nth-child(even):not(.rphi):not(.rphired):not(.rpgrand):not(.rpsub):not(.rpdiv):not(.rpwarn) td{ background:#FAFBFA }
+  table.rptbl tr.rphi td, table.rptbl tr.rphired td{ font-size:13px; letter-spacing:.01em }
+  /* Green when the figure is positive, red when it is negative. Applied to the
+     Annx-2 / Annx-3 banner rows and to the two margin rows under them, so the
+     sign reads at a glance instead of being parsed off a minus sign. rphired is
+     rphi in red - keep the two rules in step. Both are in the zebra-stripe
+     exclusion above: nth-child(even) would repaint the banner near-white while
+     the text stayed white, and the row would go invisible. */
+  table.rptbl tr.rphired td{ background:#B03A2E; color:#fff; font-weight:700 }
+  table.rptbl tr.rphired td.rpneg{ color:#FFE3DE }
+  table.rptbl tr.rpposrow td{ color:#0F5C4A; font-weight:700 }
+  table.rptbl tr.rpnegrow td{ color:#C0392B; font-weight:700 }
   table.rptbl tr.rpstock td{ color:var(--muted); font-style:italic }
   table.rptbl tr.rpstock td:first-child{ padding-left:22px }
   table.rptbl tr.rpwarn td{ background:#FFF6E5; color:#8A5A00; font-weight:600;
     text-align:left; white-space:normal; font-family:var(--ui); font-size:11px }
-  table.rptbl tr.rphi td:first-child, table.rptbl tr.rpgrand td:first-child{ font-weight:700 }
+  table.rptbl tr.rphi td:first-child, table.rptbl tr.rphired td:first-child, table.rptbl tr.rpgrand td:first-child{ font-weight:700 }
   .rpsecttitle{ margin-top:20px }
   .rpsect:first-child .rpsecttitle{ margin-top:4px }
   .rpsect{ break-inside:avoid; page-break-inside:avoid }
@@ -2926,10 +2936,59 @@ function renderStockTable(){
 }
 
 /* ---------------- Reports (dropdown + dynamic inputs + CSV export) ---------------- */
+/* Period label in the reporting format: '1st Jul to 31st Jul 26'.
+   Built from the yyyy-MM-dd keys by string split, never Date parsing, so it
+   cannot drift by a day across timezones. */
+var RP_MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function rpOrd(d){
+  if(d%10===1 && d!==11) return d+'st';
+  if(d%10===2 && d!==12) return d+'nd';
+  if(d%10===3 && d!==13) return d+'rd';
+  return d+'th';
+}
+function rpFmtPeriod(fromKey, toKey){
+  if(!fromKey||!toKey) return '';
+  var f=String(fromKey).split('-').map(Number), t=String(toKey).split('-').map(Number);
+  if(f.length<3||t.length<3||!f[0]||!t[0]) return '';
+  return rpOrd(f[2])+' '+RP_MON[f[1]-1]+' to '+rpOrd(t[2])+' '+RP_MON[t[1]-1]+' '+String(t[0]).slice(-2);
+}
+/* Weekend counts. Trading pattern differs on Sat and Sun, so they are reported
+   separately rather than as one weekend figure. Per-day KPIs still divide by
+   calendar days \u2014 these are for context, not a denominator. */
+function rpWeekendCounts(fromKey, toKey){
+  var out={sat:0,sun:0};
+  if(!fromKey||!toKey) return out;
+  var f=String(fromKey).split('-').map(Number), t=String(toKey).split('-').map(Number);
+  if(f.length<3||t.length<3) return out;
+  var d=new Date(f[0],f[1]-1,f[2]), e=new Date(t[0],t[1]-1,t[2]);
+  var guard=0;
+  while(d<=e && guard++<4000){
+    var w=d.getDay();
+    if(w===6) out.sat++;
+    if(w===0) out.sun++;
+    d.setDate(d.getDate()+1);
+  }
+  return out;
+}
+
+/* Column labels for the value columns: the base period and, when comparing, the
+   comparison period \u2014 so a merged table says WHICH period each column is,
+   instead of an anonymous '(cmp)'. Percentage columns are left alone; stamping a
+   period on '% of Total Income' adds width and no information. */
+var _rpPerBase='', _rpPerCmp='';
+function _rpStampCol(h, label){
+  var t=String(h||'');
+  if(!label) return t;
+  if(/%/.test(t)) return t;
+  return t+' \u00b7 '+label;
+}
 function rpMergeOne(bh, br, ch, cr){
   var cmpByKey={}; (cr||[]).forEach(function(r){ cmpByKey[String(r[0])]=r; });
   var headers=[bh[0]];
-  for(var i=1;i<bh.length;i++){ headers.push(bh[i]); headers.push(bh[i]+' (cmp)'); }
+  for(var i=1;i<bh.length;i++){
+    headers.push(_rpStampCol(bh[i], _rpPerBase));
+    headers.push(_rpStampCol(bh[i], _rpPerCmp));
+  }
   var rows=(br||[]).map(function(r){
     var c=cmpByKey[String(r[0])]||[]; var out=[r[0]];
     for(var i=1;i<r.length;i++){ out.push(r[i]); out.push(c[i]!=null?c[i]:''); }
@@ -3039,7 +3098,7 @@ function rpExportPdf(){
       if(_rpPeriod) l2.push(String(_rpPeriod));
       pdf.text(l2.join('   \u00b7   '), M, M+30);
       pdf.setFontSize(8); pdf.setTextColor(140,150,146);
-      pdf.text('Generated '+todayStr()+'   \u00b7   build '+String(APP_BUILD), M, M+43);
+      pdf.text('Generated '+todayStr(), M, M+43);
       pdf.setDrawColor(220,226,222); pdf.setLineWidth(0.8);
       pdf.line(M, M+50, pw-M, M+50);
       return M+62;
@@ -3162,6 +3221,7 @@ function rpTableFromPnL(res){ return { headers:['Line','Amount'], rows:rpPnlStat
    it locally lets the target be changed without another archive read.
    ═══════════════════════════════════════════════════════════ */
 var _rpBeTarget = 35;      // break-even target consumption %, from the report input
+var _rpFixedOn  = true;    // 'Calculate Fixed expenses from backend' - report input
 
 function rpP(v){ return (typeof v==='number' && isFinite(v)) ? ((v*100).toFixed(2)+'%') : '\u2014'; }
 function rpNum(v){ return rpN2(typeof v==='number' ? v : 0); }
@@ -3178,270 +3238,248 @@ function rpPnlRows(ns, list){
 
 function rpTableFromPnLPack(res){
   var P=res.period||{}, inc=P.income||{}, dir=P.direct||{}, ind=P.indirect||{},
-      k=P.kpi||{}, memo=P.memo||{}, be=P.beBase||{};
-  var ns=inc.netSales||0;
-  var S=[];
+      memo=P.memo||{}, fd=P.food||{}, bv=P.bev||{};
+  var S=[], days=P.days||1;
 
-  /* TOTAL INCOME excludes the department closing balance. Closing stock is not
-     income \u2014 it is unconsumed cost, so it sits in section B as a NEGATIVE
-     directly under Opening Stock. Arithmetically neutral: A loses it, B gains it
-     as a deduction, so Gross Profit is unchanged. What DOES change is the
-     percentage base \u2014 sections B and C, the KPIs, break-even and the memo are
-     all read against Total Income now. Section A keeps Net Sales as its base
-     because NET SALES is the 100% line there.
+  /* ── INCOME, bifurcated ────────────────────────────────────────────────────
+     Restaurant and aggregator are netted SEPARATELY because their GST behaves
+     differently, and the single 'NET SALES' line up to v22 hid that.
 
-     Note this reverses the v21 decision to hold Net Sales as the base. Total
-     Income includes Complimentary Income and Staff Food, neither of which became
-     cash, so every cost ratio reads lower against it than against Net Sales and
-     break-even reads nearer. Deliberate, per the reporting structure. */
-  var ti   = (inc.totalNetIncome||0) - (inc.returnsAddBack||0);
-  var bTot = (dir.total||0) - (inc.returnsAddBack||0);
-  var pctTI = function(a){ return ti>0 ? rpP(a/ti) : '\u2014'; };
+     res.a1 is the gross-by-order-type list the deleted Annexure 1 used to print.
+     _wsGetPnLPack still returns it, so the split is a front-end change with no
+     backend edit. Restaurant is defined as every order type that is NOT an
+     aggregator - built from the data, so a new order type appears on the report
+     by itself instead of vanishing into a bucket nobody reconciles.
 
+     GST treatment, which is the whole reason for the split:
+       - Restaurant: inc.gstOnSales in full. Under GST s.9(5) the aggregator is
+         liable for tax on supplies made through its platform, so aggregator
+         invoices carry NO tax in the sales archive. There is nothing to
+         double-count by charging the entire figure here.
+       - Aggregator: the 5% embedded in the gross remittance, gross - gross/1.05.
+         It never reaches us, so it is a deduction from income. To v22 it sat in
+         Direct Expenses instead. Moving it is arithmetically neutral on Gross
+         Profit - income falls and direct expenses fall by the same amount - but
+         it lowers Total Income, which is the base for every ratio below. */
+  var a1=res.a1||[];
+  var restLines=[], restGross=0, zGross=0, sGross=0;
+  a1.forEach(function(o){
+    var amt=o.amount||0, ot=String(o.orderType||'');
+    if(/zomato/i.test(ot))      zGross+=amt;
+    else if(/swiggy/i.test(ot)) sGross+=amt;
+    else { restLines.push([ot, amt]); restGross+=amt; }
+  });
+  var restGST=inc.gstOnSales||0;
+  var netRest=restGross-restGST;
+  var aggGST=(dir.zomatoGST||0)+(dir.swiggyGST||0);
+  var netAgg=zGross+sGross-aggGST;
+  var comp=inc.compIncome||0, staff=inc.staffFoodIncome||0;
+  var ti=netRest+netAgg+comp+staff;
+  var pctTI=function(a){ return ti>0 ? rpP(a/ti) : '\u2014'; };
+  var pctOf=function(a,b){ return b>0 ? rpP(a/b) : '\u2014'; };
+  var rowsTI=function(list){ return list.map(function(x){ var a=x[1]||0; return [x[0], rpNum(a), pctTI(a)]; }); };
+
+  var netCons=(dir.consumption||0)+(dir.openingStock||0)-(inc.returnsAddBack||0);
+  var aggCost=(dir.zomatoComm||0)+(dir.swiggyComm||0)+(dir.zomatoAds||0)+(dir.swiggyAds||0);
+  var aTot=netCons+aggCost+(dir.deTotal||0);
+  var gp=ti-aTot, gpm=ti>0?(gp/ti):0;
+
+  /* Fixed expenses are a REPORT INPUT now: 'No' excludes the backend figure
+     entirely instead of pulling Fixed_Expenses x days. Done client-side from the
+     payload rather than as a server flag, so toggling costs no round trip and no
+     redeploy, exactly like the break-even target. */
+  var fixedOn=(_rpFixedOn!==false);
+  var fixed=fixedOn?(ind.fixed||0):0;
+  var bTot=fixed+(ind.other||0);
+  var np=gp-bTot, npm=ti>0?(np/ti):0;
+
+  var _wk=rpWeekendCounts(P.fromKey, P.toKey);
   S.push({ title:'PERIOD AT A GLANCE', headers:['Measure','Value'], rows:[
-    ['Total Income', rpNum(ti)],
-    ['Gross Profit / (Loss)', rpNum(P.grossProfit)],
-    ['Net Profit / (Loss)', rpNum(P.netProfit)],
-    ['Net Profit Margin', rpP(P.netProfitMargin)],
-    ['Days in period', P.days||0]
+    ['Total Income (Annx-1)', rpNum(ti)],
+    ['Gross Profit / (Loss) (Annx-2)', rpNum(gp)],
+    ['Net Profit / (Loss) (Annx-3)', rpNum(np)],
+    ['Net Profit / Loss Margin', rpP(npm)],
+    ['Saturdays in period', _wk.sat],
+    ['Sundays in period', _wk.sun]
   ]});
 
-  S.push({ title:'A. INCOME', headers:['Particulars','Amount (Rs.)','% of Net Sales'],
-    rows: rpPnlRows(ns, [
-      ['Gross Sale (all order types)', inc.grossSale],
-      ['Less: GST on Sales', inc.gstOnSales],
-      ['NET SALES', ns],
-      ['Add: Complimentary Income (billed at 0%)', inc.compIncome],
-      ['Add: Staff Food Income', inc.staffFoodIncome],
-      ['TOTAL INCOME (A)', ti]
-    ])});
+  var incLines=[];
+  restLines.forEach(function(r){ incLines.push([r[0], r[1]]); });
+  /* The two GST lines MUST carry distinct labels. rpMergeOne keys comparison
+     rows by label within a section, so two rows both called 'Less: GST on above
+     Sales' would collide and the second would overwrite the first in compare
+     mode - silently, with a plausible-looking number. */
+  incLines.push(['Less: GST on Restaurant Sales', -restGST]);
+  incLines.push(['Net Restaurant Sales', netRest]);
+  if(zGross) incLines.push(['Zomato', zGross]);
+  if(sGross) incLines.push(['Swiggy', sGross]);
+  incLines.push(['Less: GST on Aggregator Sales (5% embedded, Zomato + Swiggy)', -aggGST]);
+  incLines.push(['Net Aggregator Sales', netAgg]);
+  incLines.push(['Add: Complimentary Income (billed at 0%)', comp]);
+  incLines.push(['Add: Staff Food Income', staff]);
+  incLines.push(['Annx-1: TOTAL INCOME', ti]);
+  S.push({ title:'INCOME BIFURCATION',
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows:rowsTI(incLines) });
 
-  var bLines=[
-    ['Consumption \u2014 Food, Beverage & Stores', dir.consumption],
-    ['Add: Opening Stock at Departments', dir.openingStock],
+  var aLines=[
+    ['Consumption \u2014 Food, Beverage & Stores', dir.consumption||0],
+    ['Add: Opening Stock at Departments', dir.openingStock||0],
     ['Less: Closing Stock at Departments', -(inc.returnsAddBack||0)],
-    ['Zomato Commission', dir.zomatoComm],
-    ['Swiggy Commission', dir.swiggyComm],
-    ['Zomato GST', dir.zomatoGST],
-    ['Swiggy GST', dir.swiggyGST],
-    ['Zomato Advertisement', dir.zomatoAds],
-    ['Swiggy Advertisement', dir.swiggyAds]
+    ['Net Consumptions', netCons],
+    ['Zomato Commission', dir.zomatoComm||0],
+    ['Swiggy Commission', dir.swiggyComm||0],
+    ['Zomato Advertisement', dir.zomatoAds||0],
+    ['Swiggy Advertisement', dir.swiggyAds||0]
   ];
-  (dir.deHeads||[]).forEach(function(h){ bLines.push(['Direct expense \u2014 '+h.head, h.amount]); });
-  bLines.push(['TOTAL DIRECT EXPENSES (B)', bTot]);
-  S.push({ title:'B. DIRECT EXPENSES (variable cost of sales)',
-    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, bLines) });
+  (dir.deHeads||[]).forEach(function(h){ aLines.push(['Direct expense \u2014 '+h.head, h.amount]); });
+  aLines.push(['TOTAL DIRECT EXPENSES (A)', aTot]);
+  S.push({ title:'A. DIRECT EXPENSES (variable cost of sales)',
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows:rowsTI(aLines) });
 
-  S.push({ title:'GROSS PROFIT (A - B)', headers:['Measure','Value'], rows:[
-    ['Consumption % of Total Income', pctTI(dir.consumption)],
-    ['GROSS PROFIT (A - B)', rpNum(P.grossProfit)],
-    ['Gross Profit Margin (on Net Sales)', rpP(P.grossProfitPct)]
-  ]});
-
-  var cLines=[['Fixed Expenses', ind.fixed]];
-  (ind.otherHeads||[]).forEach(function(h){ cLines.push(['Other \u2014 '+h.head, h.amount]); });
-  cLines.push(['Other Expenses (total)', ind.other]);
-  cLines.push(['TOTAL INDIRECT EXPENSES (C)', ind.total]);
-  S.push({ title:'C. INDIRECT EXPENSES (fixed / period costs)',
-    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, cLines) });
-
-  S.push({ title:'NET PROFIT / (LOSS) (A - B - C)', headers:['Measure','Value'], rows:[
-    ['NET PROFIT / (LOSS)', rpNum(P.netProfit)],
-    ['Net Profit Margin (on Net Sales)', rpP(P.netProfitMargin)]
-  ]});
-
-  /* KPI percentages are recomputed here from the payload's AMOUNTS rather than
-     from the server's pre-computed *Pct fields, which are all Net-Sales based.
-     Recomputing locally keeps this a front-end-only change \u2014 no redeploy. */
-  S.push({ title:'KEY PERFORMANCE INDICATORS', headers:['Indicator','Value'], rows:[
-    ['Gross Sale per Day', rpNum(k.grossSalePerDay)],
-    ['Net Sales per Day', rpNum(k.netSalesPerDay)],
-    ['Consumption % of Total Income', pctTI(dir.consumption)],
-    ['Direct Expense % of Total Income', pctTI(bTot)],
-    ['Fixed Expense per Day', rpNum(k.fixedPerDay)],
-    ['Fixed Expense % of Total Income', pctTI(ind.fixed)],
-    ['Aggregator Sale (Zomato + Swiggy, gross)', rpNum(k.aggSale)],
-    ['Aggregator Cost (commission + GST + ads)', rpNum(k.aggCost)],
-    ['Aggregator Cost % of Aggregator Sale', rpP(k.aggCostPctAggSale)],
-    ['Discount % of Gross Sale', rpP(k.discountPctGross)],
-    ['Complimentary Sale % of Total Income', pctTI(memo.compSale)]
-  ]});
-
-  /* BREAK-EVEN, on the Total Income base. otherDirectPct is recomputed because
-     be.otherDirectPct is Net-Sales based: the aggregator + DE amount is B's
-     total less the two stock lines. The contribution-margin figures are still
-     COMPUTED \u2014 break-even divides by them \u2014 they are simply no longer
-     printed. The two warnings depend on them and are kept, because reporting
-     impossibility beats printing a confident number with no meaning. */
-  var tgt=(parseFloat(_rpBeTarget)||0)/100;
-  var otherDirectAmt=(dir.total||0)-(dir.consumption||0)-(dir.openingStock||0);
-  var odp = ti>0 ? (otherDirectAmt/ti) : 0;
-  var consPctTI = ti>0 ? ((dir.consumption||0)/ti) : 0;
-  var cm=1-tgt-odp, cmAct=1-consPctTI-odp;
-  var fpo=be.fixedPlusOther||0, days=be.days||1;
-  var beRows=[
-    ['Target Consumption % of Total Income (assumption)', rpP(tgt)],
-    ['Actual Consumption % of Total Income', rpP(consPctTI)],
-    ['Aggregator & other direct cost % of Total Income (actual)', rpP(odp)],
-    ['Fixed + Other expenses as % of Total Income', pctTI(fpo)]
+  /* Tripwire. Gross Profit under this layout is algebraically identical to the
+     server's P.grossProfit - the aggregator-GST move cancels between income and
+     direct expenses - so any divergence means the payload and this renderer
+     disagree about a line, which is precisely what Annexure 6 used to catch
+     before it was removed. Printed only when it actually breaks. */
+  var gpRows=[
+    ['Annx-2: GROSS PROFIT (Annx-1 \u2212 A)', rpNum(gp)],
+    ['Gross Profit Margin (on Total Income)', rpP(gpm)]
   ];
-  if(cmAct<=0){
-    beRows.push(['\u26a0 At actual cost',
-      'Contribution margin is nil or negative, so every additional rupee of sale increases the loss. Volume alone cannot fix this \u2014 cost % must come down too.']);
+  if(Math.abs(gp-(P.grossProfit||0))>1){
+    gpRows.push(['\u26a0 Reconciliation',
+      'This block computes Gross Profit as '+rpNum(gp)+' but the server reports '+
+      rpNum(P.grossProfit||0)+'. A line item is being counted differently by the two. '+
+      'Do not rely on the figures below until this is nil.']);
   }
-  if(ti>0 && fpo>ti){
+  S.push({ title:'Annx-2: GROSS PROFIT', headers:['Measure','Value'], rows:gpRows });
+
+  var bLines=[];
+  if(!fixedOn){
+    bLines.push(['Fixed Expenses \u2014 EXCLUDED (not calculated from backend)', 0]);
+  } else if(ind.fixedHeads && ind.fixedHeads.length){
+    /* Bifurcation by head when the backend supplies it. Falls back to the single
+       total so this renderer works against both the current payload and the one
+       that will carry fixedHeads. */
+    ind.fixedHeads.forEach(function(h){ bLines.push(['Fixed \u2014 '+h.head, h.amount]); });
+  } else {
+    bLines.push(['Fixed Expenses', fixed]);
+  }
+  (ind.otherHeads||[]).forEach(function(h){ bLines.push(['Other \u2014 '+h.head, h.amount]); });
+  bLines.push(['TOTAL INDIRECT EXPENSES (B)', bTot]);
+  S.push({ title:'B. INDIRECT EXPENSES (fixed / period costs)',
+    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows:rowsTI(bLines) });
+
+  S.push({ title:'Annx-3: NET PROFIT / (LOSS)', headers:['Measure','Value'], rows:[
+    ['Annx-3: NET PROFIT / (LOSS) (Annx-2 \u2212 B)', rpNum(np)],
+    ['Net Profit Margin (on Total Income)', rpP(npm)]
+  ]});
+
+  S.push({ title:'KEY PERFORMANCE INDICATORS', headers:['Indicator','Value'], rows:[
+    ['Gross Sale per Day (Restaurant and Aggregator Sales)', rpNum((restGross+zGross+sGross)/days)],
+    ['Net Sales per Day (Restaurant and Aggregator Sales)', rpNum((netRest+netAgg)/days)],
+    ['Consumption % of Total Income', pctTI(netCons)],
+    ['Direct Expense % of Total Income', pctTI(aTot)],
+    ['Indirect Expense per Day', rpNum(bTot/days)],
+    ['Indirect Expense % of Total Income', pctTI(bTot)],
+    ['Aggregator Sale (Zomato + Swiggy, excl. GST)', rpNum(netAgg)],
+    ['Aggregator Cost (commission + ads)', rpNum(aggCost)],
+    ['Aggregator Cost % of Aggregator Sale', pctOf(aggCost, netAgg)]
+  ]});
+
+  /* BREAK-EVEN on the ACTUAL gross profit margin: Total Indirect / GP margin.
+     This is a change of meaning, not just of formula. To v22 break-even was
+     solved at the TARGET consumption %, so moving the target moved the answer.
+     It is now solved at the cost structure actually achieved, which makes the
+     target an assumption printed for reference only - it no longer feeds the
+     number. The section title says so rather than inviting a re-run that
+     changes nothing. */
+  var tgt=(parseFloat(_rpBeTarget)||0)/100;
+  var beRows=[
+    ['Target Consumption % of Total Income (assumption, not used below)', rpP(tgt)],
+    ['Actual Consumption % of Total Income', pctTI(netCons)],
+    ['Aggregator & other direct cost % of Total Income (actual)', pctTI(aggCost+(dir.deTotal||0))],
+    ['Fixed + Other expenses % of Total Income', pctTI(bTot)]
+  ];
+  if(ti>0 && bTot>ti){
     beRows.push(['\u26a0 Fixed cost',
       'Fixed and other period costs alone exceed Total Income, so break-even is unattainable at this volume even at zero food cost.']);
   }
-  if(cm>0){
-    var beSales=fpo/cm;
-    beRows.push(['Break-even Total Income required for the period', rpNum(beSales)]);
-    beRows.push(['Break-even Total Income required per Day', rpNum(beSales/days)]);
-    beRows.push(['Gap vs. Actual Total Income (shortfall)', rpNum(beSales-ti)]);
+  if(gpm>0){
+    var beInc=bTot/gpm;
+    beRows.push(['Break-even Total Income required for the period', rpNum(beInc)]);
+    beRows.push(['Break-even Total Income required per Day', rpNum(beInc/days)]);
+    beRows.push(['Gap vs. Actual Total Income (negative = shortfall)', rpNum(ti-beInc)]);
   } else {
-    beRows.push(['Break-even Total Income required for the period','Not attainable']);
-    beRows.push(['Why','Contribution margin is nil or negative at this cost structure \u2014 every additional rupee of sale increases the loss. Cost % and volume must move together.']);
+    beRows.push(['\u26a0 At actual cost',
+      'Gross profit margin is nil or negative, so every additional rupee of sale increases the loss. Volume alone cannot fix this \u2014 cost % must come down too.']);
+    beRows.push(['Break-even Total Income required for the period', 'Not attainable']);
   }
-  S.push({ title:'BREAK-EVEN ANALYSIS (change the target % above and re-run)',
+  S.push({ title:'BREAK-EVEN ANALYSIS (on actual gross profit margin)',
     headers:['Particulars','Amount / %'], rows:beRows });
 
-  S.push({ title:'MEMO / INFORMATION ITEMS (not charged to the P&L above)',
-    headers:['Particulars','Amount (Rs.)','% of Total Income'], rows: rpPnlRows(ti, [
-      ['Discount Given', memo.discount],
-      ['Complimentary Sale (net value given free)', memo.compSale],
-      ['Cancelled Sale', memo.cancelledSale],
-      ['Spoilage Value', memo.spoilage]
-    ])});
+  /* Each memo line is a percentage of its OWN base, not of one shared base, so
+     rowsTI cannot be used here - the third column is built per row. */
+  var baseSales=netRest+netAgg;
+  S.push({ title:'MEMO / INFORMATION ITEMS',
+    headers:['Particulars','Amount (Rs.)','% of Their Values'], rows:[
+      ['Trade Discount Given (% of Aggregator and Restaurant Sales)', rpNum(memo.discount), pctOf(memo.discount||0, baseSales)],
+      ['Complimentary Sale (% of Total Income)', rpNum(memo.compSale), pctOf(memo.compSale||0, ti)],
+      ['Cancelled Sale (% of Aggregator and Restaurant Sales)', rpNum(memo.cancelledSale), pctOf(memo.cancelledSale||0, baseSales)],
+      ['Spoilage Value (% of Net Consumptions)', rpNum(memo.spoilage), pctOf(memo.spoilage||0, netCons)]
+    ]});
 
-  // ── Annexures ──
-  var gs=inc.grossSale||0;
-  var a1=(res.a1||[]).map(function(r){ return [r.orderType, rpNum(r.amount), gs>0?rpP(r.amount/gs):'\u2014']; });
-  a1.push(['Total Gross Sale', rpNum(gs), gs>0?'100.00%':'\u2014']);
-  S.push({ title:'ANNEXURE 1 | SALES BY ORDER TYPE (gross)',
-    headers:['Order Type','Amount (Rs.)','% of Gross Sale'], rows:a1 });
+  /* ── FOOD & BEVERAGE COST, folded in ──────────────────────────────────────
+     Was its own report to v22. It needs NO extra server call: _wsGetPnLPack and
+     _wsGetFoodCostReport both built their period from _pnlPeriod_, and that
+     function already returns the food and bev blocks - the pack has been
+     carrying them all along and this renderer simply ignored them. One call, and
+     the two views cannot drift apart because there is only one of them now.
 
-  var ct=0; (res.a2||[]).forEach(function(r){ ct+=r.amount||0; });
-  var a2=(res.a2||[]).map(function(r){ return [r.mode, rpNum(r.amount), gs>0?rpP(r.amount/gs):'\u2014']; });
-  a2.push(['Total Collection', rpNum(ct), gs>0?rpP(ct/gs):'\u2014']);
-  S.push({ title:'ANNEXURE 2 | SALES BY PAYMENT MODE (gross)',
-    headers:['Payment Mode','Amount (Rs.)','% of Gross Sale'], rows:a2 });
+     'Total Sales' in these blocks is the food-cost report's own base (net food
+     sales + comp food + staff food) and is deliberately NOT Total Income above.
+     The caveat row says so, because two differently-defined totals on one page
+     is how a reader ends up comparing the wrong pair. */
+  var cSales=(fd.totalSales||0)+(bv.totalSales||0), cCost=(fd.cost||0)+(bv.cost||0);
+  S.push({ title:'FOOD & BEVERAGE COST \u2014 COMBINED', headers:['Particulars','Amount (Rs.)'], rows:[
+    ['Food Total Sales', rpNum(fd.totalSales)],
+    ['Beverage Total Sales', rpNum(bv.totalSales)],
+    ['Total Sales (Food + Beverage)', rpNum(cSales)],
+    ['Food Cost', rpNum(fd.cost)],
+    ['Cost of Beverages', rpNum(bv.cost)],
+    ['TOTAL COST (Food + Beverage)', rpNum(cCost)],
+    ['Combined Cost %', pctOf(cCost, cSales)],
+    ['Combined Cost per Day', rpNum(cCost/days)],
+    ['\u26a0 Basis', 'Total Sales here is net food/beverage sales plus complimentary and staff food \u2014 a narrower base than Total Income (Annx-1) above. The two are not interchangeable. '+(res.bevNote||'')]
+  ]});
 
-  var t3=[0,0,0,0,0];
-  var a3=(res.a3||[]).map(function(r){
-    t3[0]+=r.revenue||0; t3[1]+=r.consumption||0; t3[2]+=r.opn||0; t3[3]+=r.ret||0; t3[4]+=r.grossProfit||0;
-    return [r.dept, rpNum(r.revenue), rpNum(r.consumption), rpNum(r.opn), rpNum(r.ret), rpNum(r.grossProfit)]; });
-  a3.push(['Total', rpNum(t3[0]), rpNum(t3[1]), rpNum(t3[2]), rpNum(t3[3]), rpNum(t3[4])]);
-  S.push({ title:'ANNEXURE 3 | DEPARTMENT-WISE GROSS PROFIT',
-    headers:['Department','Revenue (Rs.)','Consumption (Rs.)','Opening (Rs.)','Closing (Rs.)','Gross Profit (Rs.)'], rows:a3 });
+  S.push({ title:'FOOD COST', headers:['Particulars','Amount (Rs.)'], rows:[
+    ['Food Net Sales (excl. Beverages)', rpNum(fd.netSales)],
+    ['Income From Comp Sales (Food)', rpNum(fd.compIncome)],
+    ['Income From Staff Food', rpNum(fd.staffFoodIncome)],
+    ['Total Sales (Food)', rpNum(fd.totalSales)],
+    ['Food Cost', rpNum(fd.cost)],
+    ['Food Cost %', rpP(fd.costPct)],
+    ['Food Cost per Day', rpNum((fd.cost||0)/days)]
+  ]});
 
-  /* % is taken on ISSUE, not on net. Consumption in this P&L is gross issue
-     value, so basing the mix on anything else gives percentages that cannot be
-     tied back to the consumption figure in section B. Spoilage is shown but
-     excluded from Net, because the P&L excludes it too \u2014 it is a memo item. */
-  var t4i=0,t4r=0,t4s=0,t4o=0; (res.a4||[]).forEach(function(r){ t4i+=r.iss||0; t4r+=r.ret||0; t4s+=r.spo||0; t4o+=r.opn||0; });
-  var a4=(res.a4||[]).map(function(r){
-    return [r.category, rpNum(r.iss), rpNum(r.opn), rpNum(r.ret), rpNum(r.spo),
-            rpNum((r.iss||0)+(r.opn||0)-(r.ret||0)),
-            t4i>0?rpP((r.iss||0)/t4i):'\u2014']; });
-  a4.push(['Total', rpNum(t4i), rpNum(t4o), rpNum(t4r), rpNum(t4s), rpNum(t4i+t4o-t4r), t4i>0?'100.00%':'\u2014']);
-  S.push({ title:'ANNEXURE 4 | CONSUMPTION BY CATEGORY',
-    headers:['Category','Issue (Rs.)','Opening (Rs.)','Closing (Rs.)','Spoilage (Rs.)','Net Consumption (Rs.)','% of Issue'], rows:a4 });
+  S.push({ title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
+    ['Beverages Sales (net)', rpNum(bv.netSales)],
+    ['Comp. Beverage Sale', rpNum(bv.compIncome)],
+    ['Total Beverage Sales', rpNum(bv.totalSales)],
+    ['Cost of Beverages', rpNum(bv.cost)],
+    ['Beverage Cost %', rpP(bv.costPct)],
+    ['Beverage Cost per Day', rpNum((bv.cost||0)/days)]
+  ]});
 
-  /* A tolerance of one rupee, not zero: FIFO rates carry more decimal places
-     than the archive stores, so an exact-zero test would flag healthy periods. */
-  S.push({ title:'ANNEXURE 5 | RECONCILIATION CHECKS (auto-calculated)',
-    headers:['Check','Difference (Rs.)','Status'],
-    rows:(res.a5||[]).map(function(r){
-      return [r.check, rpNum(r.diff), (Math.abs(r.diff||0)<1 ? 'OK' : 'INVESTIGATE')]; })});
-
-  S.push({ title:'ANNEXURE 6 | BRIDGE — DEPARTMENT GROSS PROFIT TO P&L GROSS PROFIT',
-    headers:['Particulars','Amount (Rs.)'],
-    rows:(res.a6||[]).map(function(r){ return [r.particular, rpNum(r.amount)]; })});
+  /* Annexures 1-6 removed at the owner's instruction (10 Aug 2026), reconfirmed
+     11 Aug 2026. Everything they were built from is still returned by
+     _wsGetPnLPack - a1 is in fact now consumed by the income bifurcation above -
+     so any of them can be restored as its own report with no backend change. */
 
   return { sections:S };
 }
 
-/* Food & Beverage Cost — three blocks from ONE server call.
-   _wsGetFoodCostReport already returns the whole period object, so P.food and
-   P.bev both arrive together; a combined view needs no extra archive read and
-   cannot disagree with either half. */
-function rpTableFromFbCost(res){
-  var P=res.period||{}, f=P.food||{}, b=P.bev||{}, inc=P.income||{};
-  var days=P.days||1;
 
-  var cSales=(f.totalSales||0)+(b.totalSales||0);
-  var cCost =(f.cost||0)+(b.cost||0);
-
-  return { sections:[
-    { title:'COMBINED \u2014 FOOD & BEVERAGE', headers:['Particulars','Amount (Rs.)'], rows:[
-      ['Food Total Sales', rpNum(f.totalSales)],
-      ['Beverage Total Sales', rpNum(b.totalSales)],
-      ['Total Sales (Food + Beverage)', rpNum(cSales)],
-      ['Food Cost', rpNum(f.cost)],
-      ['Cost of Beverages', rpNum(b.cost)],
-      ['TOTAL COST (Food + Beverage)', rpNum(cCost)],
-      ['Combined Cost %', rpP(cSales>0?(cCost/cSales):0)],
-      ['Combined Cost per Day', rpNum(cCost/days)]
-    ]},
-
-    { title:'FOOD COST', headers:['Particulars','Amount (Rs.)'], rows:[
-      ['Food Net Sales (excl. Beverages)', rpNum(f.netSales)],
-      ['Income From Comp Sales (Food)', rpNum(f.compIncome)],
-      ['Income From Staff Food', rpNum(f.staffFoodIncome)],
-      ['Total Sales', rpNum(f.totalSales)],
-      ['Food Cost', rpNum(f.cost)],
-      ['Food Cost %', rpP(f.costPct)],
-      ['Food Cost per Day', rpNum((f.cost||0)/days)]
-    ]},
-
-    { title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
-      ['Beverages Sales (net)', rpNum(b.netSales)],
-      ['Comp. Beverage Sale', rpNum(b.compIncome)],
-      ['Total Beverage Sales', rpNum(b.totalSales)],
-      ['Cost of Beverages', rpNum(b.cost)],
-      ['Beverage Cost %', rpP(b.costPct)],
-      ['Beverage Cost per Day', rpNum((b.cost||0)/days)]
-    ]},
-
-    { title:'CONTEXT', headers:['Measure','Value'], rows:[
-      ['Net Sales (all)', rpNum(inc.netSales)],
-      ['Combined cost % of total Net Sales', rpP((inc.netSales>0)?(cCost/inc.netSales):0)],
-      ['Food share of Net Sales', rpP((inc.netSales>0)?((f.netSales||0)/inc.netSales):0)],
-      ['Beverage share of Net Sales', rpP((inc.netSales>0)?((b.netSales||0)/inc.netSales):0)],
-      ['Days in period', P.days||0]
-    ]},
-
-    /* Printed so the number is auditable. A cost report whose definition is
-       invisible is a number nobody can check or challenge. catsDisplay is the
-       de-duplicated list \u2014 the server still matches on every spelling
-       variant, but printing them was repetition, not information. */
-    { title:'DEFINITION \u2014 what is counted', headers:['Basis','Included'], rows:[
-      ['Food departments (issue destination)', (res.depts||[]).join(', ')],
-      ['Beverage departments (issue destination)', (res.bevDepts||[]).join(', ')],
-      ['Item categories (both)', ((res.catsDisplay&&res.catsDisplay.length)?res.catsDisplay:(res.cats||[])).join(', ')],
-      ['\u26a0 Beverage scope', res.bevNote||res.note||''],
-      ['Excluded', 'Banquet departments, transfer departments, and any category outside the list above \u2014 so Food + Beverage will always be less than total consumption.']
-    ]}
-  ]};
-}
-
-
-function rpTableFromFullPnL(res){
-  var sections=[{ title:'P&L Statement', headers:['Line','Amount'], rows:rpPnlStatement(res.topline||{}) }];
-  var dp=res.deptPnL;
-  if(dp && dp.stats){
-    var drows=Object.keys(dp.stats).map(function(d){ var s=dp.stats[d]; var cons=s.iss||0, ret=s.ret||0, gp=(s.rev||0)-(cons-ret);
-      return [d, rpN2(s.rev||0), rpN2(cons), rpN2(ret), rpN2(gp)]; });
-    drows.push(['TOTAL', rpN2(dp.tRev||0), rpN2(dp.tCons||0), rpN2(dp.tRet||0), rpN2(dp.tGp||0)]);
-    sections.push({ title:'Department P&L', headers:['Department','Revenue','Consumption','Return','Gross Profit'], rows:drows });
-  }
-  var cb=res.consBif;
-  if(cb){
-    var crows=Object.keys(cb).map(function(cat){ var s=cb[cat]; return [cat, rpN2(s.iss||0), rpN2(s.ret||0), rpN2(s.spo||0), rpN2((s.iss||0)-(s.ret||0)+(s.spo||0))]; });
-    sections.push({ title:'Consumption by Category', headers:['Category','Issue','Return','Spoilage','Net'], rows:crows });
-  }
-  return { sections:sections };
-}
 function rpTableFromClosingVal(res){
   var rows=(res.items||[]).filter(function(it){ return (it.closeQty||0)!==0 || (it.closeVal||0)!==0; })
     .map(function(it){ var q=it.closeQty||0, v=it.closeVal||0; return [it.name, it.cat||'', it.uom||'', rpN2(q), rpN2(q?v/q:0), rpN2(v)]; });
@@ -3459,19 +3497,26 @@ function rpTableFromReorder(res){
 }
 var REPORTS=[
   {id:'pnl',       label:'Summary P&L — Manager view',       cap:'Report: Summary P&L',    compare:true, inputs:['range'], run:function(p){ return api('getSummaryPnLTopline',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromPnL},
-  /* Replaced: was getFullPnL + rpTableFromFullPnL. Now the management format.
-     _rpBeTarget is stashed in run() because table() only ever receives the
-     server response, and the break-even target is a client-side input. */
+  /* Replaced the old getFullPnL action, whose handler and renderer were deleted
+     on 11 Aug 2026 once this had superseded them. Now the management format.
+     _rpBeTarget and _rpFixedOn are stashed in run() because table() only ever
+     receives the server response, and both are client-side inputs.
+
+     The Food & Beverage Cost report was folded into this one on 11 Aug 2026 and
+     its separate entry removed. getPnLPack already returns the food and bev
+     blocks (both reports built their period from _pnlPeriod_), so nothing was
+     lost and there is one fewer call. The getFoodCostReport route and the
+     'Report: Food Cost' capability still exist server-side and are simply no
+     longer called from here - deliberate, so no gateway or permission edit is
+     needed and the report can be restored by re-adding an entry. */
   {id:'fullpnl',   label:'Summary P&L — Full',                cap:'Report: Full P&L',       compare:true,
-     inputs:['range',{k:'target',label:'Break-even target consumption %',kind:'text',ph:'35'}],
-     run:function(p){ _rpBeTarget=parseFloat(p.target)||35; return api('getPnLPack',{fromKey:p.from,toKey:p.to}); },
+     inputs:['range',
+             {k:'target',label:'Break-even target consumption %',kind:'text',ph:'35'},
+             {k:'fixed',label:'Calculate Fixed expenses from backend',kind:'select',
+              options:[['1','Yes \u2014 calculate from backend'],['0','No \u2014 exclude fixed expenses']]}],
+     run:function(p){ _rpBeTarget=parseFloat(p.target)||35; _rpFixedOn=(String(p.fixed||'1')!=='0');
+                      return api('getPnLPack',{fromKey:p.from,toKey:p.to}); },
      table:rpTableFromPnLPack},
-  /* One report, three blocks. Kept on the getFoodCostReport action and the
-     'Report: Food Cost' capability so no new gateway route, capability row or
-     permission is needed \u2014 the 'Report: Beverage Cost' capability simply
-     goes unused. */
-  {id:'fbcost',    label:'Food & Beverage Cost report',       cap:'Report: Food Cost',      compare:true, inputs:['range'],
-     run:function(p){ return api('getFoodCostReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromFbCost},
   {id:'stockmove', label:'Stock movement (Open/Purch/Issued/Close)', cap:'Report: Stock Movement', inputs:['range'], run:function(p){ return api('getStockReport',{fromKey:p.from,toKey:p.to}); }, table:rpTableFromStockReport},
   {id:'livestock', label:'Live stock (on hand now)',         cap:'Report: Live Stock',     inputs:[],        run:function(p){ return api('getStockStatus'); }, table:rpTableFromLiveStock},
   {id:'stockitem', label:'Stock Item Analysis (Purchase/Issue/Return)', cap:'Report: Stock Item Analysis', inputs:['range',{k:'type',label:'Type',kind:'select',options:[['purchase','Purchase'],['issue','Issue'],['return','Return'],['fifolayers','FIFO layers']]},{k:'category',label:'Category (optional)',kind:'text',list:'rpCatList',ph:'All'},{k:'item',label:'Item (optional)',kind:'text',list:'rpItemList',ph:'All'}], run:function(p){
@@ -3589,10 +3634,20 @@ function rpRun(r){
   $('rpBody').innerHTML='<div class="stub">Generating…</div>';
   $('rpCsv').style.display='none'; $('rpPdf').style.display='none'; $('rpJpg').style.display='none'; _rpTable=null;
   var btn=$('rpRun'); btn.disabled=true; var lbl=btn.textContent; btn.innerHTML='<span class="spin"></span>';
-  var period = p.from ? (rpFmt(p.from)+' → '+rpFmt(p.to)) : '';
+  /* Reporting period label. When comparing, the heading spans the whole range
+     covered \u2014 earliest start to latest end \u2014 while each value column
+     still names its own period via _rpPerBase / _rpPerCmp. */
+  _rpPerBase = rpFmtPeriod(p.from, p.to);
+  _rpPerCmp  = doCmp ? rpFmtPeriod(cp.from, cp.to) : '';
+  var period = _rpPerBase;
+  if(doCmp && cp.from && cp.to){
+    var lo = (String(cp.from) < String(p.from)) ? cp.from : p.from;
+    var hi = (String(cp.to)   > String(p.to))   ? cp.to   : p.to;
+    period = rpFmtPeriod(lo, hi);
+  }
   var done=function(t, labelSuffix){
     _rpTable=t; _rpLabel=r.label+(labelSuffix||''); _rpPeriod=period||'';
-    var title='<div class="rptitle"><b>'+esc(r.label)+'</b>'+(period?('<span> · '+esc(period)+(doCmp?(' vs '+esc(rpFmt(cp.from))+' → '+esc(rpFmt(cp.to))):'')+'</span>'):'')+'</div>';
+    var title='<div class="rptitle"><b>'+esc(r.label)+'</b>'+(period?('<span> · '+esc(period)+'</span>'):'')+'</div>';
     var host=document.createElement('div'); rpRenderTableInto(host, t);
     $('rpBody').innerHTML=title+host.innerHTML;
     var hasData = t.sections ? t.sections.some(function(s){ return (s.rows||[]).length; }) : (t.rows && t.rows.length);
@@ -3604,7 +3659,7 @@ function rpRun(r){
       var base=a[0], cmp=a[1];
       if(!base.ok){ handleErr({message:base.error}); return; }
       var bt=r.table(base), ct2=(cmp&&cmp.ok)?r.table(cmp):{headers:bt.headers,rows:[],sections:bt.sections?[]:undefined};
-      done(rpMergeCompare(bt, ct2), ' (compare)');
+      done(rpMergeCompare(bt, ct2), '');   // no '(compare)' suffix — the period label carries it
     }).catch(handleErr).then(function(){ btn.disabled=false; btn.textContent=lbl; });
   } else {
     r.run(p).then(function(res){
@@ -3636,9 +3691,18 @@ function rpFmt(v){
    'GROSS PROFIT (A - B)', which is why the report rendered flat. Ordered most
    specific first \u2014 'Add:'/'Less:' is tested after the TOTAL patterns so a
    subtotal is never demoted to a stock line. */
-function rpRowClass(first){
+/* Takes the WHOLE row now, not just the label, because the Annx-2 / Annx-3
+   banners and the two margin rows are coloured by the SIGN of their figure and
+   the label alone cannot tell us that. row[1] is the base period's value; in
+   compare mode rpMergeOne puts the comparison in row[2], so keying off row[1]
+   colours the row by the base period, which is what the heading leads with. */
+function rpRowClass(first, row){
   var s=String(first||'').trim();
+  var neg=function(){ return !!(row && row.length>1 && rpIsNeg(row[1])); };
   if(/^\u26a0/.test(s)) return 'rpwarn';
+  if(/^Annx-1: TOTAL INCOME$/i.test(s)) return 'rphi';
+  if(/^Annx-[23]:/i.test(s)) return neg() ? 'rphired' : 'rphi';
+  if(/^(Gross|Net) Profit Margin \(on Total Income\)$/i.test(s)) return neg() ? 'rpnegrow' : 'rpposrow';
   if(/^TOTAL INCOME \(A\)$/i.test(s)) return 'rphi';
   if(/^GROSS PROFIT \(A - B\)$/i.test(s)) return 'rphi';
   if(/^NET PROFIT \/ \(LOSS\)/.test(s)) return 'rphi';   // case-SENSITIVE: the title-case
@@ -3646,8 +3710,14 @@ function rpRowClass(first){
                                                         // GLANCE must stay unbannered
   if(/^GROSS PROFIT as per P&L Statement$/i.test(s)) return 'rphi';
   if(/^TOTAL (DIRECT|INDIRECT) EXPENSES/i.test(s)) return 'rpgrand';
+  if(/^TOTAL COST \(Food \+ Beverage\)$/i.test(s)) return 'rpgrand';
   if(/^NET SALES$/i.test(s)) return 'rpgrand';
   if(/^(GRAND TOTAL|TOTAL|Total|Total Gross Sale|Total Collection)$/.test(s)) return 'rpgrand';
+  /* Netted subtotals inside a block. Checked BEFORE the Add:/Less: rule so a
+     future 'Net ...' line that also starts with a keyword is not indented. */
+  if(/^Net (Restaurant|Aggregator) Sales$/i.test(s)) return 'rpsub';
+  if(/^Net Consumptions$/i.test(s)) return 'rpsub';
+  if(/^Total (Sales|Beverage Sales) \(?/i.test(s)) return 'rpsub';
   if(/SUBTOTAL$/i.test(s)) return 'rpsub';
   if(/^(Add:|Less:)/i.test(s)) return 'rpstock';
   if(/^\u2014.*\u2014$/.test(s)) return 'rpdiv';
@@ -3664,7 +3734,7 @@ function rpIsNeg(c){
 function rpOneTable(headers, rows){
   var head='<tr>'+(headers||[]).map(function(h){ return '<th>'+esc(h)+'</th>'; }).join('')+'</tr>';
   var body=(rows||[]).map(function(r){
-    var cls=rpRowClass(r[0]);
+    var cls=rpRowClass(r[0], r);
     var cells=r.map(function(c,i){
       var v=rpFmt(c), cc='';
       if(i>0 && rpIsNeg(c)) cc=' class="rpneg"';
