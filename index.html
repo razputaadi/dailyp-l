@@ -3613,7 +3613,12 @@ function rpTableFromPnLPack(res){
   /* Found by name across BOTH head lists, because the owner types it into
      PnL_Expenses_Archive and it may be typed DE or IDI. Matches 'payment' plus
      handl/gateway/process, or a bare 'handling fee'. */
-  var _apFeeRe=/(payment.*(handl|gateway|process))|(handling\s*fee)/i;
+  /* Widened after a test showed 'Razorpay Gateway Charges' - a perfectly ordinary way
+     to name this head - matched nothing, because 'Razorpay' contains 'pay' but not
+     'payment'. A bare 'gateway charge/fee' is unambiguous enough in a restaurant
+     expense list to accept on its own. Still deliberately narrow: it will not match a
+     head that merely mentions payment, such as 'Payment to Vendor'. */
+  var _apFeeRe=/(payment.*(handl|gateway|process))|(handling\s*fee)|(gateway\s*(charge|fee))/i;
   var apFee=0, apFeeHeads=[];
   [].concat(dir.deHeads||[], ind.otherHeads||[]).forEach(function(h){
     if(_apFeeRe.test(String(h.head||''))){ apFee+=(h.amount||0); apFeeHeads.push(h.head); }
@@ -3674,10 +3679,25 @@ function rpTableFromPnLPack(res){
   apRows.push(['\u2014 Expenses \u2014','','']);
   apAdd('Commission (Zomato + Swiggy)', apComm);
   apAdd('Advertisement (Zomato + Swiggy)', apAds);
-  apAdd('Payment Handling Fees'+(apFeeHeads.length?(' \u2014 '+apFeeHeads.join(', ')):''), apFee);
+  /* The matched head name is appended only when it ADDS something. The owner's head
+     is itself called 'Payment Handling Fees', so appending it produced 'Payment
+     Handling Fees - Payment Handling Fees'. Compared on a loose key (lower-cased,
+     non-alphanumerics stripped) so 'payment-handling fees' or 'Payment Handling Fee'
+     are recognised as the same label too; a genuinely different head, say 'Razorpay
+     Gateway Charges', still shows so it is clear what was picked up. */
+  var _apLbl='Payment Handling Fees';
+  var _apLoose=function(x){ return String(x||'').toLowerCase().replace(/[^a-z0-9]/g,''); };
+  var _apExtra=apFeeHeads.filter(function(h){ return _apLoose(h)!==_apLoose(_apLbl); });
+  apAdd(_apLbl+(_apExtra.length?(' \u2014 '+_apExtra.join(', ')):''), apFee);
   apAdd('Salary \u2014 1 person at '+rpNum(AGG_PL_SALARY_PER_DAY)+'/day \u00d7 '+days+' days', apSalary);
   apRows.push(['TOTAL EXPENSES', rpNum(apExp), apPct(apExp)]);
   apRows.push(['Annx-4: AGGREGATOR NET PROFIT / (LOSS)', rpNum(apNP), apPct(apNP)]);
+  /* Prints, unlike the Basis note. This qualifies the FIGURE, not its sourcing: the
+     margin above is before the production and delivery costs of the orders it earned,
+     so a reader who sees 51% without this line has been misled. Labelled 'Remarks'
+     rather than with the warning glyph precisely so the rpnoprint rule does not catch
+     it and strip it from the PDF. */
+  apRows.push(['Remarks', 'Before Food & Beverages, LPG & Coal, and Packaging Costs', '']);
   /* A COUNT, so no percentage - apAdd would divide it by Net Order Value and print
      a meaningless share. */
   if(ap.invoices) apRows.push(['Orders in period', ap.invoices, '']);
@@ -3906,6 +3926,19 @@ function rpRenderTableInto(b, t){
 }
 function rpFmt(v){
   if(v==null) return '';
+  /* Safety net for binary-float noise. A figure that is really 112.10 can arrive as
+     112.10000000000001; String() would print all seventeen significant digits, which
+     looks broken on screen and, in a CSV, exceeds what a spreadsheet parses as a
+     plain number - the cell lands as TEXT and will not sum.
+
+     Six decimals is far more than any figure in this system carries, so this cannot
+     lose real precision; it only discards the representation error. Handlers should
+     still round at source - this catches the one that forgets. Numbers only: strings
+     and dates pass through untouched. */
+  if(typeof v==='number'){
+    if(!isFinite(v)) return '';
+    return String(Math.round(v*1e6)/1e6);
+  }
   var s=String(v);
   var mm=s.match(/^(\d{4})-(\d{2})-(\d{2})T/);
   if(mm) return mm[3]+'-'+mm[2]+'-'+mm[1];
@@ -3934,6 +3967,9 @@ function rpRowClass(first, row){
      figures that must agree do not, which means the numbers are wrong, and that has
      to reach the printed copy. */
   if(/^\u26a0 (Basis|Composition)/.test(s)) return 'rpwarn rpnoprint';
+  /* Same amber block as a warning, but NO rpnoprint: a remark that qualifies a
+     headline figure has to survive into the printed copy. */
+  if(/^Remarks$/i.test(s)) return 'rpwarn';
   if(/^\u26a0/.test(s)) return 'rpwarn';
   if(/^Annx-1: TOTAL INCOME$/i.test(s)) return 'rphi';
   if(/^Annx-4: AGGREGATOR NET PROFIT/i.test(s)) return neg() ? 'rphired' : 'rphi';
