@@ -3054,14 +3054,15 @@ function _rpHideNoPrint(node){
   return function(){ Array.prototype.forEach.call(rows, function(r,i){ r.style.display=prev[i]; }); };
 }
 function _rpCaptureNow(node, cb){
-  var wraps=node.querySelectorAll('.matrix-wrap'), saved=[];
-  Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
+  /* Unclip first, THEN measure. The previous version set overflow:visible but left
+     the wrapper's narrow width, so wide tables spilled outside the captured box and
+     the right-hand columns never made it into the JPEG. */
+  var unclip=_rpUnclipWraps(node);
   var showAgain=_rpHideNoPrint(node);
-  var restore=function(){
-    Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; });
-    showAgain();
-  };
-  html2canvas(node, {scale:2, backgroundColor:'#ffffff', windowWidth: node.scrollWidth+40}).then(function(c){
+  var done=false;
+  var restore=function(){ if(done) return; done=true; showAgain(); unclip(); };
+  var fullW=Math.max(node.scrollWidth, node.offsetWidth)+40;
+  html2canvas(node, {scale:2, backgroundColor:'#ffffff', windowWidth:fullW, width:node.scrollWidth}).then(function(c){
     restore(); cb(c);
   }).catch(function(){ restore(); toast('Could not render image', true); });
 }
@@ -3072,19 +3073,50 @@ function rpExportJpeg(){
     toast('JPEG downloaded');
   });
 }
-/* PDF export, paginated on SECTION boundaries.
-   The old version captured the whole report as one canvas and cut it at fixed
-   pixel heights, which sliced table rows and section titles in half. This
-   captures each .rpsect separately and starts a new page when the next section
-   will not fit, so a section is never split unless it is taller than a page on
-   its own \u2014 and only that section is sliced, never its neighbours.
+/* Unclip every horizontally-scrolling wrapper for the duration of an export and
+   return a function that puts it back.
 
-   The header and footer are drawn as jsPDF TEXT, not captured pixels, so they
-   stay crisp at any zoom and cost nothing in file size.
+   overflow:visible ALONE is not enough and that was the bug: the wrapper keeps its
+   narrow layout width, the table simply spills outside the element box, and
+   html2canvas captures the element's BOX - so everything to the right of the
+   visible area was silently dropped. The width has to be forced out to scrollWidth
+   as well, so the element genuinely becomes as wide as its content.
 
-   All sections are scaled by ONE common factor derived from the widest block, so
-   type size is identical throughout instead of each table being fitted to width
-   independently. */
+   Callers must unclip BEFORE measuring anything. A clipped wrapper reports the
+   visible width, so measuring first under-reports every wide table. */
+function _rpUnclipWraps(node){
+  var wraps=node.querySelectorAll('.matrix-wrap'), prev=[];
+  Array.prototype.forEach.call(wraps, function(w){
+    prev.push({o:w.style.overflow, wd:w.style.width, mw:w.style.maxWidth, d:w.style.display});
+    var need=w.scrollWidth;
+    w.style.overflow='visible';
+    w.style.maxWidth='none';
+    if(need>w.clientWidth) w.style.width=need+'px';
+  });
+  return function(){
+    Array.prototype.forEach.call(wraps, function(w,i){
+      w.style.overflow=prev[i].o; w.style.width=prev[i].wd;
+      w.style.maxWidth=prev[i].mw; w.style.display=prev[i].d;
+    });
+  };
+}
+
+/* PDF export, paginated on SECTION boundaries, with PER-PAGE ORIENTATION.
+
+   Each section is measured and asked which way up it fits better: the fit scale is
+   min(usableW/w, usableH/h) for each orientation and the winner takes it, with a
+   2% margin in portrait's favour so a section does not flip for a negligible gain.
+   Consecutive sections wanting the same orientation share a page; a change of
+   orientation forces a new page. So a wide matrix gets its own landscape page
+   while the narrow blocks around it stay portrait, in one document.
+
+   Scale is held constant WITHIN an orientation - one factor derived from the widest
+   portrait section, another from the widest landscape one - so type size does not
+   jump between sections that share a page.
+
+   The header and footer are drawn as jsPDF TEXT, not captured pixels, so they stay
+   crisp at any zoom and cost nothing in file size. Page width is re-read after
+   every addPage because it changes with orientation. */
 function rpExportPdf(){
   var body=$('rpBody');
   if(!body){ return; }
@@ -3098,17 +3130,50 @@ function rpExportPdf(){
     var JS=(window.jspdf&&window.jspdf.jsPDF)||window.jsPDF;
     if(!JS){ toast('PDF tool not loaded \u2014 try again', true); return; }
 
-    var pdf=new JS({orientation:'p', unit:'pt', format:'a4'});
-    var pw=pdf.internal.pageSize.getWidth(), ph=pdf.internal.pageSize.getHeight();
-    var M=34, cw=pw-M*2;
-    var SCALE=2;
-    var baseW=0;
-    blocks.forEach(function(b){ baseW=Math.max(baseW, b.scrollWidth); });
-    if(!baseW) baseW=body.scrollWidth||600;
-    var f=cw/(baseW*SCALE);          // one common canvas->pt factor
+    var M=34, SCALE=2, GAP=12;
+
+    var unclip=_rpUnclipWraps(body);          // unclip BEFORE measuring
+    var showAgain=_rpHideNoPrint(body);
+    var restored=false;
+    function restore(){ if(restored) return; restored=true; showAgain(); unclip(); }
+
+    // A4 usable areas, both ways up
+    var PW=595.28, PH=841.89;
+    var pcw=PW-M*2, pch=PH-M*2-30;
+    var lcw=PH-M*2, lch=PW-M*2-30;
+
+    /* Orientation is a LEGIBILITY test, not a fit contest.
+       The obvious rule - pick whichever orientation fits the section better - is
+       wrong, and measurably so: for anything wider than it is tall the fit is
+       width-limited in both orientations, so landscape always wins and every
+       narrow P&L section ends up sideways on its own page.
+
+       What actually matters is whether portrait leaves the type readable. A
+       section w CSS px wide, scaled to a portrait text column of pcw points, puts
+       one CSS pixel at pcw/w points, so ~13px body text lands at 13*pcw/w pt.
+       MIN_RATIO 0.46 keeps that at roughly 6pt, which is the smallest that still
+       reads on paper. Portrait is used whenever it clears that bar; landscape only
+       when it cannot. A section too wide for landscape as well still goes
+       landscape - it is the best available - and the shared scale keeps it
+       consistent with its neighbours. */
+    var MIN_RATIO=0.46;
+    var meas=blocks.map(function(b){
+      var w=Math.max(b.scrollWidth, b.offsetWidth, 1);
+      var h=Math.max(b.scrollHeight, b.offsetHeight, 1);
+      return { w:w, h:h, land:((pcw/w) < MIN_RATIO) };
+    });
+
+    var bwP=0, bwL=0;
+    meas.forEach(function(m){ if(m.land){ if(m.w>bwL) bwL=m.w; } else if(m.w>bwP) bwP=m.w; });
+    var fP = bwP ? (pcw/(bwP*SCALE)) : 1;
+    var fL = bwL ? (lcw/(bwL*SCALE)) : 1;
 
     var venue='';
     try { venue=(state&&state.me&&state.me.venue)?venueDisplay(state.me.venue):''; } catch(e){}
+
+    var cur = meas[0].land ? 'l' : 'p';
+    var pdf = new JS({orientation:cur, unit:'pt', format:'a4'});
+    var pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight();
 
     function headerPage1(){
       pdf.setFont('helvetica','bold'); pdf.setFontSize(15); pdf.setTextColor(15,92,74);
@@ -3131,16 +3196,14 @@ function rpExportPdf(){
       pdf.line(M, M+14, pw-M, M+14);
       return M+24;
     }
+    function newPage(orient){
+      pdf.addPage('a4', orient);
+      cur=orient;
+      pw=pdf.internal.pageSize.getWidth(); ph=pdf.internal.pageSize.getHeight();
+      return headerCont();
+    }
 
     var y=headerPage1();
-    var bottom=ph-M-16;
-
-    /* .matrix-wrap clips horizontally on screen; html2canvas would inherit the
-       clip and cut the right-hand columns. Unclip for the capture, restore after. */
-    var wraps=body.querySelectorAll('.matrix-wrap'), saved=[];
-    Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
-    var showAgain=_rpHideNoPrint(body);   // screen-only rows out for the capture
-    function restore(){ Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; }); showAgain(); }
 
     function step(i){
       if(i>=blocks.length){
@@ -3148,25 +3211,34 @@ function rpExportPdf(){
         var n=pdf.getNumberOfPages();
         for(var p=1;p<=n;p++){
           pdf.setPage(p);
+          var w=pdf.internal.pageSize.getWidth(), h=pdf.internal.pageSize.getHeight();
           pdf.setFont('helvetica','normal'); pdf.setFontSize(8); pdf.setTextColor(150,158,154);
-          pdf.text('Page '+p+' of '+n, pw-M, ph-M+4, {align:'right'});
+          pdf.text('Page '+p+' of '+n, w-M, h-M+4, {align:'right'});
         }
         pdf.save(rpFileName('pdf'));
         toast('PDF downloaded');
         return;
       }
-      html2canvas(blocks[i], {scale:SCALE, backgroundColor:'#ffffff', windowWidth:baseW+40})
+
+      var want = meas[i].land ? 'l' : 'p';
+      /* windowWidth must cover the UNCLIPPED width or html2canvas lays the page out
+         at the viewport width and clips the right-hand columns all over again. */
+      html2canvas(blocks[i], {scale:SCALE, backgroundColor:'#ffffff',
+                              windowWidth:Math.max(meas[i].w, body.scrollWidth)+40,
+                              width:meas[i].w, height:meas[i].h})
       .then(function(c){
+        if(want!==cur){ y=newPage(want); }
+        var f = (cur==='l') ? fL : fP;
         var dw=c.width*f, dh=c.height*f;
+        var bottom=ph-M-16;
 
         if(dh>(ph-M*2-24)){
-          /* Taller than a whole page on its own: this one section is sliced, and
-             only this one. Neighbours are unaffected. */
-          if(y>M+70){ pdf.addPage(); y=headerCont(); }
+          // Taller than a whole page on its own: only THIS section is sliced.
+          if(y>M+70){ y=newPage(cur); }
           var remaining=c.height, sy=0;
           while(remaining>0){
             var availPt=bottom-y;
-            if(availPt<40){ pdf.addPage(); y=headerCont(); availPt=bottom-y; }
+            if(availPt<40){ y=newPage(cur); bottom=ph-M-16; availPt=bottom-y; }
             var sh=Math.min(Math.floor(availPt/f), remaining);
             var sl=document.createElement('canvas'); sl.width=c.width; sl.height=sh;
             sl.getContext('2d').drawImage(c, 0, sy, c.width, sh, 0, 0, c.width, sh);
@@ -3174,9 +3246,9 @@ function rpExportPdf(){
             y+=sh*f+6; remaining-=sh; sy+=sh;
           }
         } else {
-          if(y+dh>bottom){ pdf.addPage(); y=headerCont(); }
+          if(y+dh>bottom){ y=newPage(cur); }
           pdf.addImage(c.toDataURL('image/jpeg',0.94),'JPEG', M, y, dw, dh);
-          y+=dh+12;
+          y+=dh+GAP;
         }
         step(i+1);
       })
@@ -3215,8 +3287,6 @@ function rpPnlStatement(t){
   r.push(['Consumption', rpN2(t.totalCons)]);
   r.push(['Zomato commission', rpN2(t.zomatoComm)]);
   r.push(['Swiggy commission', rpN2(t.swiggyComm)]);
-  r.push(['Zomato GST', rpN2(t.zomatoGST)]);
-  r.push(['Swiggy GST', rpN2(t.swiggyGST)]);
   r.push(['Zomato ads', rpN2(t.zomatoAds)]);
   r.push(['Swiggy ads', rpN2(t.swiggyAds)]);
   r.push(['GROSS PROFIT', rpN2(t.grossProfit)]);
@@ -3293,6 +3363,10 @@ function rpTableFromPnLPack(res){
   });
   var restGST=inc.gstOnSales||0;
   var netRest=restGross-restGST;
+  /* Aggregator sales are entered NET of GST, so there is nothing to deduct here.
+     AGG_GST_PCT is 0 server-side, which makes dir.zomatoGST / dir.swiggyGST zero
+     too; this reads them anyway so the block still balances if that constant is
+     ever put back to 0.05 for gross-entered data. */
   var aggGST=(dir.zomatoGST||0)+(dir.swiggyGST||0);
   var netAgg=zGross+sGross-aggGST;
   var comp=inc.compIncome||0, staff=inc.staffFoodIncome||0;
@@ -3335,7 +3409,7 @@ function rpTableFromPnLPack(res){
   incLines.push(['Net Restaurant Sales', netRest]);
   if(zGross) incLines.push(['Zomato', zGross]);
   if(sGross) incLines.push(['Swiggy', sGross]);
-  incLines.push(['Less: GST on Aggregator Sales (5% embedded, Zomato + Swiggy)', -aggGST]);
+  if(aggGST) incLines.push(['Less: GST on Aggregator Sales', -aggGST]);
   incLines.push(['Net Aggregator Sales', netAgg]);
   incLines.push(['Add: Complimentary Income (billed at 0%)', comp]);
   incLines.push(['Add: Staff Food Income', staff]);
@@ -3403,7 +3477,7 @@ function rpTableFromPnLPack(res){
     ['Direct Expense % of Total Income', pctTI(aTot)],
     ['Indirect Expense per Day', rpNum(bTot/days)],
     ['Indirect Expense % of Total Income', pctTI(bTot)],
-    ['Aggregator Sale (Zomato + Swiggy, excl. GST)', rpNum(netAgg)],
+    ['Aggregator Sale (Zomato + Swiggy)', rpNum(netAgg)],
     ['Aggregator Cost (commission + ads)', rpNum(aggCost)],
     ['Aggregator Cost % of Aggregator Sale', pctOf(aggCost, netAgg)]
   ]});
@@ -3460,35 +3534,22 @@ function rpTableFromPnLPack(res){
      'Total Sales' in these blocks is the food-cost report's own base (net food
      sales + comp food + staff food) and is deliberately NOT Total Income above.
      ON THE SAME BASIS AS Annx-1 ─────────────────────────────────────────────
-     The server's fd/bv blocks are built from m.netSales, which is gross less the
-     SALES-ARCHIVE tax only. It has never had the 5% embedded in aggregator gross
-     taken out, because up to v22 that sat in Direct Expenses instead:
+     No adjustment is needed and none is made. With aggregator sales entered net of
+     GST, both totals reduce to the same expression:
 
         fd.totalSales + bv.totalSales = m.netSales + comp + staff
-        Total Income (Annx-1)         = m.netSales + comp + staff - aggGST
+        Total Income (Annx-1)         = m.netSales + comp + staff
 
-     so the two differed by exactly the aggregator GST. The GST is deducted here so
-     Total Sales (Food + Beverage) EQUALS Annx-1 by construction.
-
-     Split between the food and beverage blocks PRO RATA on their net sales. That
-     is a proxy and worth knowing as one: the aggregator does not report a
-     food/beverage split of its own remittance, so there is no exact figure. The
-     beverage share is taken as the REMAINDER rather than computed independently,
-     so the two parts always sum to aggGST exactly with no rounding residue.
-
-     COST is untouched - it is consumption and no GST enters it. But cost % is
-     recomputed on the new, smaller base: the server's fd.costPct / bv.costPct are
-     on the old base and would now contradict the figures printed above them. */
-  var fdNet=fd.netSales||0, bvNet=bv.netSales||0, _sumNet=fdNet+bvNet;
-  var fdGst=_sumNet>0 ? aggGST*(fdNet/_sumNet) : aggGST;
-  var bvGst=aggGST-fdGst;
-  var fdTot=(fd.totalSales||0)-fdGst, bvTot=(bv.totalSales||0)-bvGst;
-  var cSales=fdTot+bvTot, cCost=(fd.cost||0)+(bv.cost||0);
+     so they tie identically. The pro-rata GST apportionment that used to sit here
+     is gone with the GST it was correcting for - and with it the proxy of splitting
+     a department-level figure across categories by inference. If AGG_GST_PCT is
+     ever restored to 0.05 for gross-entered data, the two totals will diverge by
+     that amount again and the tripwire below will say so. */
+  var cSales=(fd.totalSales||0)+(bv.totalSales||0), cCost=(fd.cost||0)+(bv.cost||0);
 
   var combRows=[
     ['Food Total Sales', rpNum(fd.totalSales)],
     ['Beverage Total Sales', rpNum(bv.totalSales)],
-    ['Less: GST on Aggregator Sales (5% embedded)', rpNum(-aggGST)],
     ['Total Sales (Food + Beverage)', rpNum(cSales)],
     ['Food Cost', rpNum(fd.cost)],
     ['Cost of Beverages', rpNum(bv.cost)],
@@ -3496,11 +3557,8 @@ function rpTableFromPnLPack(res){
     ['Combined Cost %', pctOf(cCost, cSales)],
     ['Combined Cost per Day', rpNum(cCost/days)],
     /* rpnoprint: on screen, never in the PDF or JPEG. */
-    ['\u26a0 Basis', 'Total Sales (Food + Beverage) is stated net of the aggregator GST of '+rpNum(aggGST)+' so it agrees with Total Income (Annx-1) above. The GST is split between the two blocks pro rata on their net sales. '+(res.bevNote||'')]
+    ['\u26a0 Basis', 'Total Sales (Food + Beverage) is net food and beverage sales plus complimentary and staff food, which is the same base as Total Income (Annx-1) above \u2014 the two agree. '+(res.bevNote||'')]
   ];
-  /* Tripwire, and it prints: combined sales are Annx-1 by construction, so a
-     divergence means a line item is being counted differently by the two halves
-     of this renderer. */
   if(Math.abs(cSales-ti)>1){
     combRows.push(['\u26a0 Reconciliation',
       'Total Sales (Food + Beverage) is '+rpNum(cSales)+' but Total Income (Annx-1) is '+
@@ -3512,22 +3570,125 @@ function rpTableFromPnLPack(res){
     ['Food Net Sales (excl. Beverages)', rpNum(fd.netSales)],
     ['Income From Comp Sales (Food)', rpNum(fd.compIncome)],
     ['Income From Staff Food', rpNum(fd.staffFoodIncome)],
-    ['Less: Aggregator GST (food share)', rpNum(-fdGst)],
-    ['Total Sales (Food)', rpNum(fdTot)],
+    ['Total Sales (Food)', rpNum(fd.totalSales)],
     ['Food Cost', rpNum(fd.cost)],
-    ['Food Cost %', pctOf(fd.cost||0, fdTot)],
+    ['Food Cost %', pctOf(fd.cost||0, fd.totalSales||0)],
     ['Food Cost per Day', rpNum((fd.cost||0)/days)]
   ]});
 
   S.push({ title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
     ['Beverages Sales (net)', rpNum(bv.netSales)],
     ['Comp. Beverage Sale', rpNum(bv.compIncome)],
-    ['Less: Aggregator GST (beverage share)', rpNum(-bvGst)],
-    ['Total Beverage Sales', rpNum(bvTot)],
+    ['Total Beverage Sales', rpNum(bv.totalSales)],
     ['Cost of Beverages', rpNum(bv.cost)],
-    ['Beverage Cost %', pctOf(bv.cost||0, bvTot)],
+    ['Beverage Cost %', pctOf(bv.cost||0, bv.totalSales||0)],
     ['Beverage Cost per Day', rpNum((bv.cost||0)/days)]
   ]});
+
+  /* ── AGGREGATOR PROFIT & LOSS ──────────────────────────────────────────────
+     A standalone P&L for the delivery channel, so it can be judged on its own
+     rather than buried inside the venue total. Rendered as a section like MEMO and
+     the KPIs, at the owner's confirmation.
+
+     EVERY sale-side particular is a Sales_Archive column, named as the sheet names
+     it, in sheet order: base (items sale) E, tax F, discount G, delivery H,
+     container I, service J, additional K, deducted L, waived M, round off N,
+     total O. Nothing here is derived or apportioned. Figures are per INVOICE, not
+     per line - charges sit on the invoice, so summing them per row would multiply
+     each by its number of item lines.
+
+     Payment Handling Fees is the one expense that is NOT in Sales_Archive - that
+     sheet has no such column. It comes from PnL_Expenses_Archive, matched by head
+     name, as the owner specified.
+
+     Food & beverage cost was removed at the owner's instruction. It had been
+     reverse-calculated from the combined cost % - an allocation, not a
+     measurement, since issues are recorded per department and never per sales
+     channel. Net Profit here is therefore BEFORE any food cost. */
+  var AGG_PL_SALARY_PER_DAY = 400;
+  var ap = dir.aggParts || {};
+  var apNet = ap.netOrder || 0;
+  var apSalary = AGG_PL_SALARY_PER_DAY * days;
+
+  /* Found by name across BOTH head lists, because the owner types it into
+     PnL_Expenses_Archive and it may be typed DE or IDI. Matches 'payment' plus
+     handl/gateway/process, or a bare 'handling fee'. */
+  var _apFeeRe=/(payment.*(handl|gateway|process))|(handling\s*fee)/i;
+  var apFee=0, apFeeHeads=[];
+  [].concat(dir.deHeads||[], ind.otherHeads||[]).forEach(function(h){
+    if(_apFeeRe.test(String(h.head||''))){ apFee+=(h.amount||0); apFeeHeads.push(h.head); }
+  });
+
+  var apComm = (dir.zomatoComm||0)+(dir.swiggyComm||0);
+  var apAds  = (dir.zomatoAds||0)+(dir.swiggyAds||0);
+  var apExp  = apComm+apAds+apFee+apSalary;
+  var apNP   = apNet-apExp;
+  var apPct  = function(a){ return apNet>0 ? rpP(a/apNet) : '\u2014'; };
+
+  /* Four named particulars, everything else folded into one line, nil rows hidden.
+
+     'Other Charges / Adjustments' is computed as the RESIDUAL, not as a sum of the
+     remaining columns:
+         other = netOrder - itemsSale - container - delivery + discount
+     so the block ties to Net Order Value by construction and nothing can leak. A
+     sum of named columns would depend on the sign convention the POS uses for
+     service, additional, deducted, waived, round off and tax - and if that
+     convention were wrong the total would quietly stop agreeing with Annx-1.
+
+     The column-by-column sum is still computed, as aggParts.other server-side, and
+     compared against this residual purely as a tripwire. It fires only when the two
+     disagree, which would mean the assumed composition of the invoice total is
+     wrong. That row is NOT suppressed and NOT screen-only - a real mismatch must
+     reach the printed report.
+
+     Nil rows are suppressed throughout, at the owner's instruction. Net Order Value,
+     TOTAL EXPENSES and Annx-4 always print, because a block whose totals vanish at
+     zero is worse than one with a zero in it. Note the consequence for Payment
+     Handling Fees: while no matching expense head exists it is nil and therefore
+     hidden, and the Basis row is the only place that says so. */
+  var apOther = apNet - (ap.itemsSale||0) - (ap.container||0) - (ap.delivery||0) + (ap.discount||0);
+  var apRows=[];
+  var apAdd=function(label, v, always){
+    v=v||0;
+    if(always || Math.abs(v)>0.005) apRows.push([label, rpNum(v), apPct(v)]);
+  };
+  apAdd('A. Items Sale', ap.itemsSale);
+  apAdd('Container Charge', ap.container);
+  apAdd('Delivery Charge', ap.delivery);
+  apAdd('Other Charges / Adjustments', apOther);
+  apAdd('Less: Discount', -(ap.discount||0));
+  apRows.push(['Net Order Value', rpNum(apNet), apPct(apNet)]);
+
+  if(Math.abs(apOther-(ap.other||0))>0.005){
+    apRows.push(['\u26a0 Composition',
+      'Other Charges / Adjustments is '+rpNum(apOther)+' as a residual, but the named Sales_Archive columns (service, additional, deducted, waived, round off, tax) sum to '+
+      rpNum(ap.other||0)+'. The residual is used, so Net Order Value is still correct, but the invoice total is not composed the way this report assumes.', '']);
+  }
+
+  apRows.push(['\u2014 Expenses \u2014','','']);
+  apAdd('Commission (Zomato + Swiggy)', apComm);
+  apAdd('Advertisement (Zomato + Swiggy)', apAds);
+  apAdd('Payment Handling Fees'+(apFeeHeads.length?(' \u2014 '+apFeeHeads.join(', ')):''), apFee);
+  apAdd('Salary \u2014 1 person at '+rpNum(AGG_PL_SALARY_PER_DAY)+'/day \u00d7 '+days+' days', apSalary);
+  apRows.push(['TOTAL EXPENSES', rpNum(apExp), apPct(apExp)]);
+  apRows.push(['Annx-4: AGGREGATOR NET PROFIT / (LOSS)', rpNum(apNP), apPct(apNP)]);
+  /* A COUNT, so no percentage - apAdd would divide it by Net Order Value and print
+     a meaningless share. */
+  if(ap.invoices) apRows.push(['Orders in period', ap.invoices, '']);
+
+  if(Math.abs(apNet-netAgg)>1){
+    apRows.push(['\u26a0 Reconciliation',
+      'Net Order Value is '+rpNum(apNet)+' but Net Aggregator Sales in Annx-1 is '+
+      rpNum(netAgg)+'. These are built from the same invoices and must agree.', '']);
+  }
+  apRows.push(['\u26a0 Basis',
+    'Items Sale, Container Charge, Delivery Charge and Discount are Sales_Archive columns E, I, H and G, summed per invoice. Other Charges / Adjustments is the remainder up to the invoice total (column O) \u2014 service, additional and deducted charges, waived off, round off and any tax. Payment Handling Fees is not in Sales_Archive at all \u2014 it is read from PnL_Expenses_Archive by head name'+
+    (apFeeHeads.length ? (' and matched "'+apFeeHeads.join('", "')+'" this period.')
+                       : ', and nothing matched this period, so it reads nil. Name the head so it contains "payment handling" and it will be picked up.')+
+    ' Net Profit is BEFORE food and beverage cost.', '']);
+
+  S.push({ title:'AGGREGATOR PROFIT & LOSS',
+    headers:['Particulars','Amount (Rs.)','% of Net Order Value'], rows:apRows });
 
   /* Annexures 1-6 removed at the owner's instruction (10 Aug 2026), reconfirmed
      11 Aug 2026. Everything they were built from is still returned by
@@ -3764,6 +3925,9 @@ function rpRowClass(first, row){
   if(/^\u26a0 Basis/.test(s)) return 'rpwarn rpnoprint';
   if(/^\u26a0/.test(s)) return 'rpwarn';
   if(/^Annx-1: TOTAL INCOME$/i.test(s)) return 'rphi';
+  if(/^Annx-4: AGGREGATOR NET PROFIT/i.test(s)) return neg() ? 'rphired' : 'rphi';
+  if(/^Net Order Value$/i.test(s)) return 'rpsub';
+  if(/^TOTAL EXPENSES$/i.test(s)) return 'rpgrand';
   if(/^Annx-[23]:/i.test(s)) return neg() ? 'rphired' : 'rphi';
   if(/^(Gross|Net) Profit Margin \(on Total Income\)$/i.test(s)) return neg() ? 'rpnegrow' : 'rpposrow';
   if(/^TOTAL INCOME \(A\)$/i.test(s)) return 'rphi';
@@ -5343,4 +5507,3 @@ if('serviceWorker' in navigator){
 
 </body>
 </html>
-
