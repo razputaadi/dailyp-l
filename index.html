@@ -3003,6 +3003,13 @@ function rpMergeCompare(base, cmp){
   }
   return rpMergeOne(base.headers, base.rows, cmp.headers, cmp.rows);
 }
+/* Generated-stamp format. todayStr() is yyyy-MM-dd, which is right for FILENAMES
+   (they sort chronologically) but not for the face of a report. Export filenames
+   deliberately keep todayStr(). */
+function rpFmtDMY(){
+  var d=new Date();
+  return ('0'+d.getDate()).slice(-2)+'/'+('0'+(d.getMonth()+1)).slice(-2)+'/'+d.getFullYear();
+}
 function rpFileName(ext){ return (_rpLabel||'report').replace(/[^a-z0-9]+/gi,'_').replace(/^_|_$/g,'')+'_'+todayStr()+'.'+ext; }
 /* Loads a script once, on demand, and keeps the promise so a second export does
    not fetch it again. Cross-origin, so the service worker's fetch handler bails
@@ -3036,13 +3043,27 @@ function rpCapture(cb){
   _libExport().then(function(){ _rpCaptureNow(node, cb); })
               .catch(function(e){ toast((e&&e.message)||'Export tools failed to load', true); });
 }
+/* Hide every rpnoprint row for the duration of a capture and give back a function
+   that puts them exactly as they were. Returned as a closure rather than handled
+   by the caller because BOTH exporters have an error path as well as a success
+   path, and a restore that runs on only one of them leaves rows invisible on
+   screen after a failed export. */
+function _rpHideNoPrint(node){
+  var rows=node.querySelectorAll('tr.rpnoprint'), prev=[];
+  Array.prototype.forEach.call(rows, function(r){ prev.push(r.style.display); r.style.display='none'; });
+  return function(){ Array.prototype.forEach.call(rows, function(r,i){ r.style.display=prev[i]; }); };
+}
 function _rpCaptureNow(node, cb){
   var wraps=node.querySelectorAll('.matrix-wrap'), saved=[];
   Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
-  html2canvas(node, {scale:2, backgroundColor:'#ffffff', windowWidth: node.scrollWidth+40}).then(function(c){
+  var showAgain=_rpHideNoPrint(node);
+  var restore=function(){
     Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; });
-    cb(c);
-  }).catch(function(){ Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; }); toast('Could not render image', true); });
+    showAgain();
+  };
+  html2canvas(node, {scale:2, backgroundColor:'#ffffff', windowWidth: node.scrollWidth+40}).then(function(c){
+    restore(); cb(c);
+  }).catch(function(){ restore(); toast('Could not render image', true); });
 }
 function rpExportJpeg(){
   rpCapture(function(canvas){
@@ -3098,7 +3119,7 @@ function rpExportPdf(){
       if(_rpPeriod) l2.push(String(_rpPeriod));
       pdf.text(l2.join('   \u00b7   '), M, M+30);
       pdf.setFontSize(8); pdf.setTextColor(140,150,146);
-      pdf.text('Generated '+todayStr(), M, M+43);
+      pdf.text('Generated '+rpFmtDMY(), M, M+43);
       pdf.setDrawColor(220,226,222); pdf.setLineWidth(0.8);
       pdf.line(M, M+50, pw-M, M+50);
       return M+62;
@@ -3118,7 +3139,8 @@ function rpExportPdf(){
        clip and cut the right-hand columns. Unclip for the capture, restore after. */
     var wraps=body.querySelectorAll('.matrix-wrap'), saved=[];
     Array.prototype.forEach.call(wraps, function(w){ saved.push(w.style.overflow); w.style.overflow='visible'; });
-    function restore(){ Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; }); }
+    var showAgain=_rpHideNoPrint(body);   // screen-only rows out for the capture
+    function restore(){ Array.prototype.forEach.call(wraps, function(w,i){ w.style.overflow=saved[i]; }); showAgain(); }
 
     function step(i){
       if(i>=blocks.length){
@@ -3437,37 +3459,73 @@ function rpTableFromPnLPack(res){
 
      'Total Sales' in these blocks is the food-cost report's own base (net food
      sales + comp food + staff food) and is deliberately NOT Total Income above.
-     The caveat row says so, because two differently-defined totals on one page
-     is how a reader ends up comparing the wrong pair. */
-  var cSales=(fd.totalSales||0)+(bv.totalSales||0), cCost=(fd.cost||0)+(bv.cost||0);
-  S.push({ title:'FOOD & BEVERAGE COST \u2014 COMBINED', headers:['Particulars','Amount (Rs.)'], rows:[
+     ON THE SAME BASIS AS Annx-1 ─────────────────────────────────────────────
+     The server's fd/bv blocks are built from m.netSales, which is gross less the
+     SALES-ARCHIVE tax only. It has never had the 5% embedded in aggregator gross
+     taken out, because up to v22 that sat in Direct Expenses instead:
+
+        fd.totalSales + bv.totalSales = m.netSales + comp + staff
+        Total Income (Annx-1)         = m.netSales + comp + staff - aggGST
+
+     so the two differed by exactly the aggregator GST. The GST is deducted here so
+     Total Sales (Food + Beverage) EQUALS Annx-1 by construction.
+
+     Split between the food and beverage blocks PRO RATA on their net sales. That
+     is a proxy and worth knowing as one: the aggregator does not report a
+     food/beverage split of its own remittance, so there is no exact figure. The
+     beverage share is taken as the REMAINDER rather than computed independently,
+     so the two parts always sum to aggGST exactly with no rounding residue.
+
+     COST is untouched - it is consumption and no GST enters it. But cost % is
+     recomputed on the new, smaller base: the server's fd.costPct / bv.costPct are
+     on the old base and would now contradict the figures printed above them. */
+  var fdNet=fd.netSales||0, bvNet=bv.netSales||0, _sumNet=fdNet+bvNet;
+  var fdGst=_sumNet>0 ? aggGST*(fdNet/_sumNet) : aggGST;
+  var bvGst=aggGST-fdGst;
+  var fdTot=(fd.totalSales||0)-fdGst, bvTot=(bv.totalSales||0)-bvGst;
+  var cSales=fdTot+bvTot, cCost=(fd.cost||0)+(bv.cost||0);
+
+  var combRows=[
     ['Food Total Sales', rpNum(fd.totalSales)],
     ['Beverage Total Sales', rpNum(bv.totalSales)],
+    ['Less: GST on Aggregator Sales (5% embedded)', rpNum(-aggGST)],
     ['Total Sales (Food + Beverage)', rpNum(cSales)],
     ['Food Cost', rpNum(fd.cost)],
     ['Cost of Beverages', rpNum(bv.cost)],
     ['TOTAL COST (Food + Beverage)', rpNum(cCost)],
     ['Combined Cost %', pctOf(cCost, cSales)],
     ['Combined Cost per Day', rpNum(cCost/days)],
-    ['\u26a0 Basis', 'Total Sales here is net food/beverage sales plus complimentary and staff food \u2014 a narrower base than Total Income (Annx-1) above. The two are not interchangeable. '+(res.bevNote||'')]
-  ]});
+    /* rpnoprint: on screen, never in the PDF or JPEG. */
+    ['\u26a0 Basis', 'Total Sales (Food + Beverage) is stated net of the aggregator GST of '+rpNum(aggGST)+' so it agrees with Total Income (Annx-1) above. The GST is split between the two blocks pro rata on their net sales. '+(res.bevNote||'')]
+  ];
+  /* Tripwire, and it prints: combined sales are Annx-1 by construction, so a
+     divergence means a line item is being counted differently by the two halves
+     of this renderer. */
+  if(Math.abs(cSales-ti)>1){
+    combRows.push(['\u26a0 Reconciliation',
+      'Total Sales (Food + Beverage) is '+rpNum(cSales)+' but Total Income (Annx-1) is '+
+      rpNum(ti)+'. These must agree \u2014 do not rely on the cost percentages until they do.']);
+  }
+  S.push({ title:'FOOD & BEVERAGE COST \u2014 COMBINED', headers:['Particulars','Amount (Rs.)'], rows:combRows });
 
   S.push({ title:'FOOD COST', headers:['Particulars','Amount (Rs.)'], rows:[
     ['Food Net Sales (excl. Beverages)', rpNum(fd.netSales)],
     ['Income From Comp Sales (Food)', rpNum(fd.compIncome)],
     ['Income From Staff Food', rpNum(fd.staffFoodIncome)],
-    ['Total Sales (Food)', rpNum(fd.totalSales)],
+    ['Less: Aggregator GST (food share)', rpNum(-fdGst)],
+    ['Total Sales (Food)', rpNum(fdTot)],
     ['Food Cost', rpNum(fd.cost)],
-    ['Food Cost %', rpP(fd.costPct)],
+    ['Food Cost %', pctOf(fd.cost||0, fdTot)],
     ['Food Cost per Day', rpNum((fd.cost||0)/days)]
   ]});
 
   S.push({ title:'BEVERAGE COST', headers:['Particulars','Amount (Rs.)'], rows:[
     ['Beverages Sales (net)', rpNum(bv.netSales)],
     ['Comp. Beverage Sale', rpNum(bv.compIncome)],
-    ['Total Beverage Sales', rpNum(bv.totalSales)],
+    ['Less: Aggregator GST (beverage share)', rpNum(-bvGst)],
+    ['Total Beverage Sales', rpNum(bvTot)],
     ['Cost of Beverages', rpNum(bv.cost)],
-    ['Beverage Cost %', rpP(bv.costPct)],
+    ['Beverage Cost %', pctOf(bv.cost||0, bvTot)],
     ['Beverage Cost per Day', rpNum((bv.cost||0)/days)]
   ]});
 
@@ -3699,6 +3757,11 @@ function rpFmt(v){
 function rpRowClass(first, row){
   var s=String(first||'').trim();
   var neg=function(){ return !!(row && row.length>1 && rpIsNeg(row[1])); };
+  /* Screen-only. rpnoprint rows are hidden by the PDF and JPEG exporters and
+     restored afterwards, so an explanatory row can live on the report without
+     appearing in the printed copy. Deliberately narrow: only 'Basis'. A
+     'Reconciliation' warning means the numbers are wrong and MUST print. */
+  if(/^\u26a0 Basis/.test(s)) return 'rpwarn rpnoprint';
   if(/^\u26a0/.test(s)) return 'rpwarn';
   if(/^Annx-1: TOTAL INCOME$/i.test(s)) return 'rphi';
   if(/^Annx-[23]:/i.test(s)) return neg() ? 'rphired' : 'rphi';
