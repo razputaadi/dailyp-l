@@ -3659,7 +3659,13 @@ function rpTableFromPnLPack(res){
   apAdd('Less: Discount', -(ap.discount||0));
   apRows.push(['Net Order Value', rpNum(apNet), apPct(apNet)]);
 
-  if(Math.abs(apOther-(ap.other||0))>0.005){
+  /* Threshold is RELATIVE, not absolute. The residual and the column sum differ by
+     the rounding carried on every invoice, so across a thousand orders a few rupees
+     of drift is normal and means nothing: a flat 0.005 tolerance fired on 7.22 out
+     of 363,961, which is noise wearing a warning label. 0.01% of Net Order Value,
+     floored at Rs 1, ignores that and still catches a real structural mismatch. */
+  var _apTol=Math.max(1, apNet*0.0001);
+  if(Math.abs(apOther-(ap.other||0))>_apTol){
     apRows.push(['\u26a0 Composition',
       'Other Charges / Adjustments is '+rpNum(apOther)+' as a residual, but the named Sales_Archive columns (service, additional, deducted, waived, round off, tax) sum to '+
       rpNum(ap.other||0)+'. The residual is used, so Net Order Value is still correct, but the invoice total is not composed the way this report assumes.', '']);
@@ -3920,9 +3926,14 @@ function rpRowClass(first, row){
   var neg=function(){ return !!(row && row.length>1 && rpIsNeg(row[1])); };
   /* Screen-only. rpnoprint rows are hidden by the PDF and JPEG exporters and
      restored afterwards, so an explanatory row can live on the report without
-     appearing in the printed copy. Deliberately narrow: only 'Basis'. A
-     'Reconciliation' warning means the numbers are wrong and MUST print. */
-  if(/^\u26a0 Basis/.test(s)) return 'rpwarn rpnoprint';
+     appearing in the printed copy.
+
+     'Basis' and 'Composition' are both notes about HOW a figure was built - the
+     figures themselves are correct either way, so they belong on screen and not on
+     paper. 'Reconciliation' is deliberately NOT in this list: it fires only when two
+     figures that must agree do not, which means the numbers are wrong, and that has
+     to reach the printed copy. */
+  if(/^\u26a0 (Basis|Composition)/.test(s)) return 'rpwarn rpnoprint';
   if(/^\u26a0/.test(s)) return 'rpwarn';
   if(/^Annx-1: TOTAL INCOME$/i.test(s)) return 'rphi';
   if(/^Annx-4: AGGREGATOR NET PROFIT/i.test(s)) return neg() ? 'rphired' : 'rphi';
