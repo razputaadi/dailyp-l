@@ -503,7 +503,43 @@ function call(payload){
     var opt={ method:'POST', body:JSON.stringify(payload), redirect:'follow' };
     if(ctl) opt.signal=ctl.signal;
     fetch(API_URL, opt).then(function(r){
-      if(!r.ok) throw new Error('Server returned HTTP '+r.status);
+      if(!r.ok){
+        /* 'Server returned HTTP 404' on its own is a dead end - it says nothing about
+           WHO answered. doPost is wrapped in try/catch end to end and always returns
+           JSON, even for an error, so a 404 can never come from the gateway: it comes
+           from Google or from the host serving this page. Those two look identical in
+           the status code and completely different in the body and the final URL, so
+           both are reported.
+
+           r.url is the URL AFTER redirects. Apps Script answers /exec with a 302 to
+           script.googleusercontent.com, so a healthy call ends on that host. Ending
+           on this site's own host means GYV_API_URL was not an absolute https://
+           .../exec URL and the browser resolved it as a path on this site - which
+           404s from the host and never reaches Apps Script at all. */
+        return r.text().catch(function(){ return ''; }).then(function(body){
+          var where=r.url||API_URL;
+          var host='';
+          try{ host=new URL(where, location.href).host; }catch(e){}
+          var snip=String(body||'').replace(/<script[\s\S]*?<\/script>/gi,' ')
+                    .replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,180);
+          var hint='';
+          if(host && location && location.host && host===location.host){
+            hint='\nThis never left this website. GYV_API_URL in config.js is not an '+
+                 'absolute https://script.google.com/.../exec URL, so the browser '+
+                 'treated it as a path on this site.';
+          }else if(/^script\.google(usercontent)?\.com$/.test(host)){
+            hint='\nGoogle answered, so the URL is right but the DEPLOYMENT is not '+
+                 'serving. Check Deploy \u2192 Manage deployments: the deployment still '+
+                 'exists, is Web app, Execute as Me, Who has access Anyone.';
+          }
+          var e2=new Error('Server returned HTTP '+r.status+
+            (r.redirected?' (after a redirect)':'')+
+            '\nURL: '+where+
+            (snip?('\nServer said: '+snip):'')+hint);
+          e2.httpStatus=r.status;
+          throw e2;
+        });
+      }
       return r.text();
     }).then(function(txt){
       if(settled) return; settled=true; clearTimeout(timer);
@@ -5622,4 +5658,3 @@ if('serviceWorker' in navigator){
 
 </body>
 </html>
-     
