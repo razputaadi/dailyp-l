@@ -244,6 +244,11 @@
   .pAmt{font-family:var(--mono); font-size:12px; text-align:right; color:var(--ink); white-space:nowrap}
   .pDel{border:none; background:transparent; color:var(--danger); font-size:20px; line-height:1; padding:0; cursor:pointer}
   .phint{grid-column:1/-1; font-family:var(--mono); font-size:11px; color:var(--muted); margin:-2px 0 4px 2px}
+  /* Unit of measure for the line's item. Its own full-width grid row, so no entry
+     form's column widths change and nothing gets narrower on a phone. Accent
+     colour, not muted, because it is a fact about what is being typed rather than
+     a background suggestion like the last-rate hint. */
+  .uhint{grid-column:1/-1; font-family:var(--mono); font-size:11px; color:var(--accent); margin:-2px 0 4px 2px}
   .ptotal{margin-left:auto; font-size:14px; color:var(--muted)} .ptotal b{color:var(--ink); font-family:var(--mono)}
 
   /* async save status chips */
@@ -1648,11 +1653,14 @@ function addPurchaseLine(){
   del.onclick=function(){ wrap.parentNode.removeChild(wrap); recalcTotal(); };
  it.onchange=function(){
     showLastRate(it, wrap);
-    /* The unit belongs where the number is typed. No layout change: the qty
-       placeholder is already there and already empty. */
     var u=acUomOf(it.value); q.placeholder=u?('Qty in '+u):'0';
+    lineUomHint(it, wrap);
   };
+  /* Also on input, so a value set programmatically - CSV import, a prefill, the
+     autocomplete - updates the unit even if only the input event reaches us. */
+  it.oninput=function(){ lineUomHint(it, wrap); };
   attachItemAC(it, 'itemsDL');
+  if(it.value) lineUomHint(it, wrap);
   iss.onclick=function(){ openIssueModal(wrap); };
   revealRow(wrap, it);
 }
@@ -1675,6 +1683,29 @@ function recalcTotal(){
    an item with no history is not fetched at all, and a line that already has a
    rate does not need the hint. */
 var _lastRateCache = {};
+/* Show the item's UOM under an entry line, for purchase, issue and return alike.
+ *
+ * The qty PLACEHOLDER already carried it ('Qty in Kg') but a placeholder is gone the
+ * moment a number is typed - which is exactly when the unit matters, and why it was
+ * not visible on any of the three forms in practice. This is a real element and it
+ * stays.
+ *
+ * Rendered as its own grid row spanning every column, the same trick .phint uses, so
+ * no form's grid-template-columns changes and nothing is squeezed on a narrow screen.
+ * Kept as a SEPARATE element from .phint rather than folded into it, because
+ * showLastRate removes and rebuilds its hint on every change and skips it entirely
+ * once a rate is typed - the unit would have disappeared with it. */
+function lineUomHint(inputEl, wrap){
+  var old=wrap.querySelector('.uhint'); if(old) old.parentNode.removeChild(old);
+  var u=acUomOf(inputEl.value);
+  if(!u) return;
+  var h=document.createElement('div'); h.className='uhint'; h.textContent='Unit: '+u;
+  /* Before the last-rate hint, so the order on screen is stable no matter which of
+     the two was written most recently. */
+  var ph=wrap.querySelector('.phint');
+  if(ph) wrap.insertBefore(h, ph); else wrap.appendChild(h);
+}
+
 function showLastRate(itInput, wrap){
   var name=itInput.value.trim();
   var old=wrap.querySelector('.phint'); if(old) old.parentNode.removeChild(old);
@@ -1918,7 +1949,12 @@ function addIssueLine(){
   attachItemAC(wrap.querySelector('.iItem'), 'itemsDL2');
   (function(){
     var iIt=wrap.querySelector('.iItem'), iQ=wrap.querySelector('.iQty');
-    iIt.onchange=function(){ var u=acUomOf(iIt.value); iQ.placeholder=u?('Qty in '+u):'0'; };
+    iIt.onchange=function(){
+      var u=acUomOf(iIt.value); iQ.placeholder=u?('Qty in '+u):'0';
+      lineUomHint(iIt, wrap);
+    };
+    iIt.oninput=function(){ lineUomHint(iIt, wrap); };
+    if(iIt.value) lineUomHint(iIt, wrap);
   })();
   wrap.querySelector('.pDel').onclick=function(){ wrap.parentNode.removeChild(wrap); };
   revealRow(wrap, wrap.querySelector('.iItem'));
@@ -2118,8 +2154,12 @@ function addReturnLine(item, qty){
   var rIt=wrap.querySelector('.rItem'), rQ=wrap.querySelector('.rQty');
   if(item!=null && item!=='') rIt.value=item;
   if(qty!=null) rQ.value=qty;
-  rIt.onchange=function(){ var u=acUomOf(rIt.value); rQ.placeholder=u?('Qty in '+u):'0'; };
-  if(rIt.value){ var u0=acUomOf(rIt.value); if(u0) rQ.placeholder='Qty in '+u0; }
+  rIt.onchange=function(){
+    var u=acUomOf(rIt.value); rQ.placeholder=u?('Qty in '+u):'0';
+    lineUomHint(rIt, wrap);
+  };
+  rIt.oninput=function(){ lineUomHint(rIt, wrap); };
+  if(rIt.value){ var u0=acUomOf(rIt.value); if(u0) rQ.placeholder='Qty in '+u0; lineUomHint(rIt, wrap); }
   wrap.querySelector('.pDel').onclick=function(){ wrap.parentNode.removeChild(wrap); };
   if(!rIt.value) revealRow(wrap, rIt);
   return wrap;
@@ -3390,9 +3430,19 @@ function rpTableFromPnLPack(res){
   var np=gp-bTot, npm=ti>0?(np/ti):0;
 
   var _wk=rpWeekendCounts(P.fromKey, P.toKey);
+  /* aTot, gp, bTot and np are all computed above this point, so the glance block can
+     lead with the same figures the detailed sections reach later.
+
+     Labels here are TITLE CASE on purpose. rpRowClass styles the section totals by
+     matching UPPER CASE - 'TOTAL DIRECT EXPENSES (A)' - so title case keeps these two
+     as plain glance rows rather than repeating the heavy grand-total banding inside a
+     summary block. Same convention as 'Net Profit / (Loss)' here versus
+     'NET PROFIT / (LOSS)' below; the rule is documented in rpRowClass. */
   S.push({ title:'PERIOD AT A GLANCE', headers:['Measure','Value'], rows:[
     ['Total Income (Annx-1)', rpNum(ti)],
+    ['Total Direct Expenses (A)', rpNum(aTot)],
     ['Gross Profit / (Loss) (Annx-2)', rpNum(gp)],
+    ['Total Indirect Expenses (B)', rpNum(bTot)],
     ['Net Profit / (Loss) (Annx-3)', rpNum(np)],
     ['Net Profit / Loss Margin', rpP(npm)],
     ['Saturdays in period', _wk.sat],
@@ -3983,7 +4033,10 @@ function rpRowClass(first, row){
                                                         // 'Net Profit / (Loss)' in PERIOD AT A
                                                         // GLANCE must stay unbannered
   if(/^GROSS PROFIT as per P&L Statement$/i.test(s)) return 'rphi';
-  if(/^TOTAL (DIRECT|INDIRECT) EXPENSES/i.test(s)) return 'rpgrand';
+  /* case-SENSITIVE: the sections emit 'TOTAL DIRECT EXPENSES (A)' in caps and want the
+     grand-total band. PERIOD AT A GLANCE emits 'Total Direct Expenses (A)' in title
+     case and must stay a plain row - the same split already used for NET PROFIT. */
+  if(/^TOTAL (DIRECT|INDIRECT) EXPENSES/.test(s)) return 'rpgrand';
   if(/^TOTAL COST \(Food \+ Beverage\)$/i.test(s)) return 'rpgrand';
   if(/^NET SALES$/i.test(s)) return 'rpgrand';
   if(/^(GRAND TOTAL|TOTAL|Total|Total Gross Sale|Total Collection)$/.test(s)) return 'rpgrand';
@@ -4031,6 +4084,15 @@ function rpRenderTable(t){
   b.innerHTML='<div class="rptmeta">'+t.rows.length+' row'+(t.rows.length>1?'s':'')+'</div>'+rpOneTable(t.headers, t.rows);
 }
 function rpCsvCell(v){ var s=String(v==null?'':v); if(/[",\n\r]/.test(s)) s='"'+s.replace(/"/g,'""')+'"'; return s; }
+/* Screen-only rows are skipped here too.
+   rpnoprint is a DOM class, so hiding it works for the PDF and JPEG - which capture
+   the rendered page - but the CSV is built from the DATA and never saw it. The Basis
+   and Composition notes were therefore still landing in the spreadsheet, in the
+   amount column, after being removed from every other export. Same rule, applied to
+   the row label instead of the element. */
+function _rpCsvSkip(r){
+  return /rpnoprint/.test(rpRowClass((r&&r[0])||'', r));
+}
 function rpExportCsv(){
   if(!_rpTable){ return; }
   var lines=[];
@@ -4039,11 +4101,17 @@ function rpExportCsv(){
       if(i>0) lines.push('');
       lines.push(rpCsvCell(s.title));
       lines.push((s.headers||[]).map(rpCsvCell).join(','));
-      (s.rows||[]).forEach(function(r){ lines.push(r.map(function(c){ return rpCsvCell(rpFmt(c)); }).join(',')); });
+      (s.rows||[]).forEach(function(r){
+        if(_rpCsvSkip(r)) return;
+        lines.push(r.map(function(c){ return rpCsvCell(rpFmt(c)); }).join(','));
+      });
     });
   }else{
     lines.push((_rpTable.headers||[]).map(rpCsvCell).join(','));
-    (_rpTable.rows||[]).forEach(function(r){ lines.push(r.map(function(c){ return rpCsvCell(rpFmt(c)); }).join(',')); });
+    (_rpTable.rows||[]).forEach(function(r){
+      if(_rpCsvSkip(r)) return;
+      lines.push(r.map(function(c){ return rpCsvCell(rpFmt(c)); }).join(','));
+    });
   }
   var csv=lines.join('\r\n');
   var name=(_rpLabel||'report').replace(/[^a-z0-9]+/gi,'_').replace(/^_|_$/g,'')+'_'+todayStr()+'.csv';
