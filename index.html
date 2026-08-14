@@ -1453,8 +1453,21 @@ function revealRow(wrap, firstInput){
 
 function attachItemAC(input, dlId){ /* superseded by acUpgrade() */ }
 
-function acAttach(input, src, strict){
+/* cfg is OPTIONAL and every default reproduces the previous behaviour exactly,
+   so no existing caller changes:
+     minChars    (2)     - keystrokes before the box opens. 0 = open on empty.
+     openOnFocus (false) - also open on focus, not only on input.
+     max         (12)    - rows shown.
+   The 2-character default is right for Item, where the source is the 600-row
+   master and an unfiltered list is noise. It is wrong for a short, known,
+   date-scoped set - Vendor, Bill no, Req Sr, Department - where the whole point
+   is to SEE what exists on that date. Those fields were silently empty until you
+   typed two characters of a vendor name you were trying to look up. */
+function acAttach(input, src, strict, cfg){
   var box=null, t=null, cur=-1, opts=[];
+  var minChars   = (cfg && cfg.minChars != null) ? cfg.minChars : 2;
+  var openOnFocus= !!(cfg && cfg.openOnFocus);
+  var maxRows    = (cfg && cfg.max) ? cfg.max : 12;
   /* A touch that lands on a row is not necessarily a choice — it is just as likely
      the start of a scroll to reach the row you actually want. The old handler
      committed on pointerdown, so scrolling the list filled the field with whichever
@@ -1549,16 +1562,21 @@ function acAttach(input, src, strict){
   }
   function paint(){
     var q=input.value.trim().toLowerCase();
-    if(q.length<2){ close(); return; }
+    if(q.length<minChars){ close(); return; }
     var all=src()||[], out=[];
-    /* Twelve again: the box scrolls properly now, and a scroll can no longer be
-       mistaken for a selection. */
-    for(var i=0;i<all.length && out.length<12;i++){
+    /* An empty query matches everything, because indexOf('') is 0 — so minChars:0
+       needs no special case to show the full list. The box scrolls properly and a
+       scroll can no longer be mistaken for a selection. */
+    for(var i=0;i<all.length && out.length<maxRows;i++){
       if(String(all[i]).toLowerCase().indexOf(q)>=0) out.push(all[i]);
     }
     open(out);
   }
   input.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(paint,120); });
+  /* Focus opens the list too, when asked. Deferred a tick because focus fires
+     before the caret settles on mobile, and painting synchronously there can put
+     the box at the pre-scroll position. */
+  if(openOnFocus) input.addEventListener('focus', function(){ clearTimeout(t); t=setTimeout(paint,0); });
   /* STRICT FIELDS (item names only).
      A typed name that is not in Item_Master cannot be allowed to reach the
      archives: stock is allocated on PR_ID||item, so an unmatched name becomes a
@@ -2639,7 +2657,8 @@ function renderPendingList(list){
     /* Server-supplied count. The list no longer carries the payloads - see
        _wsListPending. p.rows is still honoured so an old cached client keeps working. */
     var lines=(p.lines!=null)?p.lines:((p.rows||[]).length);
-    var typeLabel=p.type==='issue'?'Issue':(p.type==='purchase'?'Purchase':(p.type==='return'?'Return / closing':esc(p.type)));
+    var typeLabel=p.type==='issue'?'Issue':(p.type==='purchase'?'Purchase':(p.type==='return'?'Return / closing':
+      (AM_PEND[p.type]?('Amendment \u00b7 '+AM_PEND[p.type].label):esc(p.type))));
     return '<div class="pendrow">'+
       '<div class="pendmain"><div class="pendtype">'+typeLabel+' · '+lines+' line'+(lines>1?'s':'')+
         (p.venue?(' · '+esc(p.venue)):'')+'</div>'+
@@ -2681,6 +2700,17 @@ function _editPendingWith(p, rows){
   else if(p.type==='issue'){ iMode='form'; activeTab='issues'; renderTabs(); toast('Loaded into Issues — fix and resubmit'); }
   else if(p.type==='return'){ rMode='form'; activeTab='returns'; renderTabs(); toast('Loaded into Returns — fix and resubmit'); }
   else if(p.type==='sale'){ _pendingPrefill=null; activeTab='sales'; salesMode='form'; renderTabs(); toast('Open Sales and re-enter this invoice'); }
+  else if(AM_PEND[p.type]){
+    /* A queued amendment carries the rows it TRIED to write, not a fresh recall.
+       It reopens the Amendments tab on the right entry type, but it deliberately
+       does NOT restore the id list: those ids described the archive as it stood
+       at the time, and re-applying them blind after the archive has moved is how
+       a delete misses and a voucher duplicates. Recall again, then re-edit. */
+    _amPendPrefill={type:AM_PEND[p.type].t, rows:rows||[], reason:p.reason||''};
+    _pendingPrefill=null;
+    amType=AM_PEND[p.type].t; activeTab='amend'; renderTabs();
+    toast('Reopened in Amendments \u2014 recall the entry again, then re-apply');
+  }
   else { toast('Open the matching tab to re-enter'); }
 }
 
@@ -4750,6 +4780,18 @@ var _amIds = [], _amLockReasons = [];
  * and acUpgrade skips these inputs entirely because none of them has `list`. */
 var _amOpts = { vendors: [], bills: [], reqSrs: [], depts: [] };
 
+/* Pending type strings for amendments. Kept distinct from the plain
+   'purchase' / 'issue' / 'return' types on purpose: those reopen the ENTRY forms
+   and would re-enter the rows as a brand new voucher, i.e. duplicate the very
+   entry the amendment was trying to correct. */
+var AM_PEND = {
+  'amend-purchase': { t:'purchase', label:'Purchase' },
+  'amend-issue':    { t:'issue',    label:'Issue' },
+  'amend-return':   { t:'return',   label:'Return / closing count' }
+};
+function amPendType(t){ return 'amend-' + t; }
+var _amPendPrefill = null;
+
 function amItemNames(){ return (_itemsCache && _itemsCache.items || []).map(function(x){ return x.name; }); }
 function amDeptNames(){
   var d = (_itemsCache && _itemsCache.departments) || [];
@@ -4797,7 +4839,19 @@ function renderAmend(m){
     b.onclick=function(){ if(amType===t) return; amType=t; renderAmend($('main')); };
     tw.appendChild(b);
   });
-  ensureItems(function(){ amBuildFilters(); });
+  ensureItems(function(){
+    amBuildFilters();
+    if(_amPendPrefill){
+      var out=$('amMsg');
+      if(out){
+        out.className='msg err';
+        out.innerHTML='Reopened from <b>Pending</b>: '+esc(_amPendPrefill.reason)+
+          '<br>Recall the entry again before re-applying \u2014 the saved rows are a record of '+
+          'what was attempted, not a live selection.';
+      }
+      _amPendPrefill=null;
+    }
+  });
 }
 
 function amBuildFilters(){
@@ -4817,12 +4871,16 @@ function amBuildFilters(){
   _amIds=[]; _amLockReasons=[];
   $('amDate').onchange=amLoadFilterOptions;
   $('amRecall').onclick=amRecall;
-  /* Not strict: a blank filter means "any", and these are free-text narrowing
-     fields, so a value that happens not to be in the fetched list must still be
-     typeable. Matches how the dept field behaves on the entry tabs. */
+  /* Not strict: a blank filter means "any", so a value not in the fetched list
+     must still be typeable. minChars 0 + openOnFocus because these are
+     pick-what-exists fields: Vendor and Bill no are the vendors and bills found
+     on THAT date, Req Sr the requisitions raised on that date, Department the
+     full department list. You are meant to be able to see them without knowing
+     them first. */
   d.filters.forEach(function(f){
     var el=$('amF_'+f.k);
-    if(el) acAttach(el, f.k==='dept' ? amDeptNames : amOptProvider(f.src), false);
+    if(el) acAttach(el, f.k==='dept' ? amDeptNames : amOptProvider(f.src), false,
+                    { minChars:0, openOnFocus:true, max:25 });
   });
   amLoadFilterOptions();
 }
@@ -4937,8 +4995,12 @@ function amAddLine(c, dead){
        Issued/Received by and Notes get NOTHING — an autocomplete on a free-text
        or numeric field is what produced item names in Vendor. Item is strict
        (it must resolve to the master, as on the entry tabs); dept is not. */
+    /* Item keeps the 2-character default: its source is the 600-row master and an
+       unfiltered list there is noise. Dept is a short closed list, so it opens on
+       focus like the filters. */
     if(col.t==='item') acAttach(el, amItemNames, true);
-    else if(col.t==='dept') acAttach(el, amDeptNames, false);
+    else if(col.t==='dept') acAttach(el, amDeptNames, false,
+                                    { minChars:0, openOnFocus:true, max:25 });
   });
   wrap.querySelector('.amdel').onclick=function(){ if(wrap.parentNode) wrap.parentNode.removeChild(wrap); };
   return wrap;
@@ -4972,19 +5034,52 @@ function amSubmit(){
      section on why they are never rebuilt from the edited fields. */
   api(d.action,{ ids:_amIds, rows:rows }).then(function(res){
     btn.disabled=false;
-    if(!res.ok){ out.className='msg err'; out.textContent=res.error||'Amendment failed'; return; }
+    /* REFUSED. Nothing was written — the server's guards run before the first
+       delete. The edit is queued to Pending so the work is not lost, and the form
+       is cleared so a half-read screen cannot be resubmitted by reflex. */
+    if(!res.ok){
+      queuePending(amPendType(amType), 'Amendment refused: '+(res.error||'unknown'), rows,
+                   'Refused \u2014 saved to Pending');
+      amAfterApply('err', 'Refused. '+(res.error||'Amendment failed')+
+                          '<br>Saved to <b>Pending</b> so you can come back to it.');
+      return;
+    }
     var errs=(res.errors||[]).filter(Boolean);
-    out.className=errs.length?'msg err':'msg';
-    out.innerHTML='Replaced '+(res.deleted||0)+' row'+((res.deleted||0)===1?'':'s')+
-      ' with '+rows.length+'.'+
-      (res.items&&res.items.length ? ' Re-valued: '+esc(res.items.join(', '))+'.' : '')+
-      (errs.length ? '<br><b>Warnings:</b> '+esc(errs.join(' \u2022 ')) : '');
-    _amIds=[];
-    amLoadFilterOptions();
+    var head='Replaced '+(res.deleted||0)+' row'+((res.deleted||0)===1?'':'s')+
+             ' with '+rows.length+'.'+
+             (res.items&&res.items.length ? ' Re-valued: '+esc(res.items.join(', '))+'.' : '');
+    if(errs.length){
+      /* APPLIED, BUT WITH WARNINGS. The rows ARE written — every warning is an
+         issue the replay could not cover, now sitting at rate 0 with no
+         allocation. That needs following up, so it goes to Pending as a record
+         rather than scrolling away in a toast. */
+      queuePending(amPendType(amType), 'Amendment applied with '+errs.length+
+                   ' warning(s): '+errs.join(' | '), rows, 'Applied with warnings \u2014 logged to Pending');
+      amAfterApply('err', head+'<br><b>Warnings ('+errs.length+'):</b> '+esc(errs.join(' \u2022 '))+
+                          '<br>Logged to <b>Pending</b> \u2014 these rows are valued at zero until resolved.');
+      return;
+    }
+    amAfterApply('ok', head);
   }).catch(function(e){
     btn.disabled=false;
-    out.className='msg err'; out.textContent=(e&&e.message)||'Amendment failed';
+    queuePending(amPendType(amType), 'Amendment error: '+((e&&e.message)||'unknown'), rows,
+                 'Error \u2014 saved to Pending');
+    amAfterApply('err', ((e&&e.message)||'Amendment failed')+'<br>Saved to <b>Pending</b>.');
   });
+}
+
+/* Clear the form down to a fresh filter row and keep the outcome on screen.
+ * Full reset rather than leaving the grid: _amIds described the archive BEFORE
+ * the amendment, so after a successful apply they point at rows that no longer
+ * exist. Leaving them in place lets a second click delete the wrong thing. */
+function amAfterApply(kind, html){
+  var keepDate = $('amDate') ? $('amDate').value : '';
+  _amIds=[]; _amLockReasons=[];
+  amBuildFilters();
+  if(keepDate && $('amDate')){ $('amDate').value=keepDate; amLoadFilterOptions(); }
+  var out=$('amMsg');
+  if(out){ out.className=(kind==='ok'?'msg ok':'msg err'); out.innerHTML=html; }
+  if(kind==='ok') toast('Amendment applied');
 }
 
 function needVenue(m, title){
