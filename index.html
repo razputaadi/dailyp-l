@@ -269,6 +269,22 @@
   .iline{display:grid; grid-template-columns:minmax(0,1fr) 80px 24px; gap:6px; align-items:center; margin-bottom:6px}
   .iline input{width:100%; min-width:0; padding:8px; border:1px solid var(--line); border-radius:var(--radius-sm); background:#fff}
   .iline input:focus{border-color:var(--accent); outline:none; box-shadow:0 0 0 3px var(--accent-soft)}
+  /* Amend grid. The column template is set per entry type in JS, so only the
+     shared chrome lives here. amscroll exists because a purchase row is seven
+     fields wide and a phone is not: the grid keeps its real widths and scrolls
+     sideways rather than crushing every field to unusable. */
+  .amscroll{overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:4px}
+  .amgrid{min-width:max-content}
+  .amhead,.amline{display:grid; gap:6px; align-items:center; margin-bottom:6px}
+  .amhead{font:600 11px/1 var(--display,inherit); letter-spacing:.04em;
+          text-transform:uppercase; color:var(--muted,#5C6B66); margin-bottom:4px}
+  .amline input{width:100%; min-width:0; padding:8px; border:1px solid var(--line);
+                border-radius:var(--radius-sm); background:#fff; font-size:14px}
+  .amline input:focus{border-color:var(--accent); outline:none; box-shadow:0 0 0 3px var(--accent-soft)}
+  .amline input:disabled{background:#F4F5F4; color:#8A9691}
+  .amline.amdead input{background:#F4F5F4; color:#8A9691}
+  .amdel{border:none; background:none; color:var(--muted,#5C6B66); font-size:18px;
+         line-height:1; cursor:pointer; padding:0}
 
   /* pending / unprocessed list */
   .pendrow{display:flex; align-items:center; gap:10px; padding:12px; border:1px solid var(--line);
@@ -500,7 +516,11 @@ function call(payload){
       te.timedOut=true;
       reject(te);
     }, API_CALL_TIMEOUT_MS);
-    var opt={ method:'POST', body:JSON.stringify(payload), redirect:'follow' };
+    /* cache:'no-store' — Apps Script serves the result from a SINGLE-USE
+       googleusercontent echo URL. Anything that replays that request, an HTTP cache or a
+       service worker, gets Drive's "Page not found" on the second fetch, which surfaces
+       as a redirect 404. Nothing should ever cache an API POST anyway. */
+    var opt={ method:'POST', body:JSON.stringify(payload), redirect:'follow', cache:'no-store' };
     if(ctl) opt.signal=ctl.signal;
     fetch(API_URL, opt).then(function(r){
       if(!r.ok){
@@ -645,6 +665,7 @@ var TAB_DEFS=[
   {id:'spoilage',  label:'Spoilage',  cap:'Entry: Spoilage'},
   {id:'transfer',  label:'Transfer',  cap:'Action: Inter-Venue Transfer'},
   {id:'stock',     label:'Stock',     cap:'View: Stock / Closing'},
+  {id:'amend',     label:'Amendments', cap:'Action: Amend Entries'},
   {id:'bills',     label:'Bills',     bills:true},
   {id:'reports',   label:'Reports',   reports:true},
   {id:'pending',   label:'Pending',   pending:true},
@@ -799,6 +820,7 @@ function renderMain(){
   if(def.id==='requirements'){ renderRequirements(m); return; }
   if(def.id==='bills'){ renderBills(m); return; }
   if(def.id==='returns'){ renderReturns(m); return; }
+  if(def.id==='amend'){ renderAmend(m); return; }
   m.innerHTML='<div class="card"><div class="stub">'+
     '<div class="big">'+esc(def.label)+'</div>'+
     '<div>This section will be wired up next.</div></div></div>';
@@ -969,11 +991,12 @@ function openPermsEditor(uname){
    plural, 'Entry: Sales') and 'Entry: Transfer' (the real one is
    'Action: Inter-Venue Transfer'). Those were the Sales and Transfer tabs.
 
-   Amend is deliberately NOT listed. There is no 'Action: Amend Purchase'
-   capability — AUTH_ACTION_CAP maps amendPurchases / amendIssues / amendReturns
-   onto 'Entry: Purchase' / 'Entry: Issue' / 'Entry: Return', so whoever may enter
-   may also amend. Listing a capability that grants nothing would imply a control
-   that does not exist. */
+   Amend now HAS its own capability, 'Action: Amend Entries', and AUTH_ACTION_CAP
+   maps amendPurchases / amendIssues / amendReturns / getProcessedBatch /
+   getEditFilterOptions onto it. It used to map onto 'Entry: Purchase' etc., which
+   meant whoever could enter could also rewrite — so listing it here would have
+   implied a control that did not exist. It exists now, and the Amendments tab
+   gates on it, so it is listed. */
 var PERM_TAB_CAPS=[
   ['Purchases',   ['Entry: Purchase','View: Purchases',
                    'Entry: Fixed Expense','Report: Fixed Expenses','Action: Upload Attachment']],
@@ -992,6 +1015,7 @@ var PERM_TAB_CAPS=[
                    'Report: Stock Movement','Report: Stock Item Analysis',
                    'Report: Closing Stock Valuation','Report: Reorder']],
   ['Bills',       ['Action: Upload Attachment','Action: Verify Bill','Report: Bill Verification']],
+  ['Amendments',  ['Action: Amend Entries']],
   ['Pending',     ['View: Pending']],
   ['Control',     ['Admin: Manage Users','Admin: Manage Roles']]
 ];
@@ -1628,7 +1652,8 @@ function acCloseAll(){
    Deliberately ABSENT: rpItemList and rpCatList (report filters, where a partial
    string is the whole point), vendors, and departments. Sales needs nothing —
    its item field is readonly with a fixed value. */
-var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1, retItemsDL:1 };
+var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1, retItemsDL:1,
+                        amItemsDL:1 };
 
 function acUpgrade(){
   Array.prototype.forEach.call(document.querySelectorAll('input[list]'), function(inp){
@@ -2595,18 +2620,26 @@ function loadQueue(){
     });
   }).catch(function(e){ b.innerHTML='<div class="msg err">'+esc((e&&e.message)||'Error')+'</div>'; });
 }
+var _pendTruncated=0;
 function loadPending(){
   var b=$('pendBody'); if(b) b.innerHTML='<div class="stub">Loading…</div>';
   api('listPending').then(function(res){
     if(!res.ok){ b.innerHTML='<div class="stub">'+esc(res.error||'Error')+'</div>'; return; }
+    _pendTruncated=res.truncated||0;
     renderPendingList(res.pending||[]);
   }).catch(function(e){ b.innerHTML='<div class="stub">'+esc((e&&e.message)||'Error')+'</div>'; });
 }
 function renderPendingList(list){
   var b=$('pendBody');
   if(!list.length){ b.innerHTML='<div class="stub">Nothing pending — all clear.</div>'; return; }
-  b.innerHTML=list.map(function(p){
-    var lines=(p.rows||[]).length;
+  var note=(_pendTruncated>0)
+    ? '<div class="msg err" style="margin-bottom:10px">Showing the newest '+list.length+
+      '. '+_pendTruncated+' older entr'+(_pendTruncated===1?'y is':'ies are')+
+      ' not listed — discard what you no longer need.</div>' : '';
+  b.innerHTML=note+list.map(function(p){
+    /* Server-supplied count. The list no longer carries the payloads - see
+       _wsListPending. p.rows is still honoured so an old cached client keeps working. */
+    var lines=(p.lines!=null)?p.lines:((p.rows||[]).length);
     var typeLabel=p.type==='issue'?'Issue':(p.type==='purchase'?'Purchase':(p.type==='return'?'Return / closing':esc(p.type)));
     return '<div class="pendrow">'+
       '<div class="pendmain"><div class="pendtype">'+typeLabel+' · '+lines+' line'+(lines>1?'s':'')+
@@ -2630,9 +2663,20 @@ function discardPending(id){
     if(res.ok){ toast('Discarded'); loadPending(); } else { toast(res.error||'Could not discard', true); }
   }).catch(function(e){ toast((e&&e.message)||'Error', true); });
 }
+/* The payload is fetched for THIS entry only. The list deliberately no longer carries
+   every entry's rows - all of them in one response is what made the Pending tab fail
+   with a redirect 404 once enough had accumulated. */
 function editPending(p){
   if(!p) return;
-  _pendingPrefill={type:p.type, rows:p.rows||[]};
+  if(p.rows){ _editPendingWith(p, p.rows); return; }   // old client/cached shape
+  toast('Loading entry\u2026');
+  api('getPending',{id:p.id}).then(function(res){
+    if(!res || !res.ok){ toast((res&&res.error)||'Could not load that entry', true); return; }
+    _editPendingWith(p, res.rows||[]);
+  }).catch(function(e){ toast((e&&e.message)||'Could not load that entry', true); });
+}
+function _editPendingWith(p, rows){
+  _pendingPrefill={type:p.type, rows:rows||[]};
   _editingPendingId=p.id;
   if(p.type==='purchase'){ pMode='form'; activeTab='purchases'; renderTabs(); toast('Loaded into Purchases — fix and resubmit'); }
   else if(p.type==='issue'){ iMode='form'; activeTab='issues'; renderTabs(); toast('Loaded into Issues — fix and resubmit'); }
@@ -4623,6 +4667,298 @@ function armConfirm(btn, msg, onYes){
   no.onclick=function(){ close(); };
   yes.onclick=function(){ close(); onYes(); };
 }
+/* ═══════════════════ Amendments tab ═══════════════════════════════════════
+ * Recall an already-processed entry by date + filter, edit it in place, submit.
+ *
+ * The submission contract is not obvious and matters: the amend endpoints take
+ * `ids` (every row of the recalled voucher, which they DELETE) plus `rows` (what
+ * should exist afterwards). So deleting a line means omitting it from `rows`
+ * while leaving its id in `ids`. The two lists are not row-aligned on submit and
+ * must not be made so.
+ *
+ * Corollary for issues: an issue id is a SIGNATURE, 'IS_ID‖Item‖ReqSr‖Qty'. It
+ * describes the row as STORED. Regenerating it from the edited fields would stop
+ * it matching, the delete would silently miss, and the amend would duplicate the
+ * line instead of replacing it. The ids from the recall are therefore kept
+ * verbatim and never rebuilt.
+ *
+ * Venue: the tab is hidden on 'All' because the server now refuses recall
+ * without a concrete venue — an Owner must pick ARC or ACJ first. */
+var AM_TYPES = ['purchase', 'issue', 'return'];
+var AM_DEFS = {
+  purchase: {
+    label: 'Purchase', action: 'amendPurchases', idLabel: 'PR_ID',
+    filters: [{ k:'vendor', l:'Vendor', dl:'amVendDL', src:'vendors' },
+              { k:'bill',   l:'Bill no', dl:'amBillDL', src:'bills' }],
+    cols: [{ k:'date',   l:'Date',   t:'date', w:'140px' },
+           { k:'item',   l:'Item',   t:'item', w:'minmax(160px,1.4fr)' },
+           { k:'qty',    l:'Qty',    t:'num',  w:'80px' },
+           { k:'rate',   l:'Rate',   t:'num',  w:'90px' },
+           { k:'vendor', l:'Vendor', t:'text', w:'minmax(120px,1fr)' },
+           { k:'bill',   l:'Bill no',t:'text', w:'110px' },
+           { k:'notes',  l:'Notes',  t:'text', w:'minmax(120px,1fr)' }],
+    fromRecall: function(r){ return { date:amDateStr(r[0]), item:r[1], qty:r[3], rate:r[4],
+                                      vendor:r[6], bill:r[7], notes:r[8] }; },
+    toRow: function(c){ return [c.date, c.item, c.qty, c.rate, c.vendor, c.bill, c.notes]; },
+    required: ['date','item','qty']
+  },
+  issue: {
+    label: 'Issue', action: 'amendIssues', idLabel: 'IS_ID',
+    filters: [{ k:'reqSr', l:'Req Sr', dl:'amReqDL', src:'reqSrs' }],
+    cols: [{ k:'date',  l:'Date',   t:'date', w:'140px' },
+           { k:'reqSr', l:'Req Sr', t:'text', w:'100px' },
+           { k:'item',  l:'Item',   t:'item', w:'minmax(160px,1.4fr)' },
+           { k:'qty',   l:'Qty',    t:'num',  w:'80px' },
+           { k:'dept',  l:'Dept',   t:'dept', w:'minmax(120px,1fr)' },
+           { k:'by1',   l:'Issued by', t:'text', w:'110px' },
+           { k:'by2',   l:'Received by', t:'text', w:'110px' },
+           { k:'notes', l:'Notes',  t:'text', w:'minmax(120px,1fr)' }],
+    fromRecall: function(r){ return { date:amDateStr(r[0]), reqSr:r[1], item:r[2], qty:r[4],
+                                      dept:r[5], by1:r[6], by2:r[7], notes:'' }; },
+    toRow: function(c){ return [c.date, c.reqSr, c.item, c.qty, c.dept, c.by1, c.by2, c.notes]; },
+    required: ['date','item','qty','dept']
+  },
+  'return': {
+    label: 'Return / closing count', action: 'amendReturns', idLabel: 'RT_ID',
+    filters: [{ k:'dept', l:'Department', dl:'amDeptDL', src:'depts' }],
+    cols: [{ k:'date',  l:'Count date', t:'date', w:'140px' },
+           { k:'dept',  l:'Dept',  t:'dept', w:'minmax(120px,1fr)' },
+           { k:'item',  l:'Item',  t:'item', w:'minmax(160px,1.4fr)' },
+           { k:'qty',   l:'Qty on hand', t:'num', w:'90px' },
+           { k:'notes', l:'Notes', t:'text', w:'minmax(120px,1fr)' }],
+    fromRecall: function(r){ return { date:amDateStr(r[0]), dept:r[1], item:r[2], qty:r[4], notes:r[6] }; },
+    toRow: function(c){ return [c.date, c.dept, c.item, c.qty, c.notes]; },
+    required: ['date','dept','item','qty']
+  }
+};
+var amType = 'purchase';
+var _amIds = [], _amLockReasons = [];
+
+/* Apps Script serialises a Date to a UTC ISO string. Every date this system
+   stores is anchored to NOON in the spreadsheet timezone, so the UTC instant is
+   still the same calendar day for any offset inside ±12h and slicing the first
+   ten characters is safe. Anchoring is what makes it safe — a midnight-anchored
+   date in IST would serialise to 18:30Z the PREVIOUS day and this would read one
+   day early. */
+function amDateStr(v){
+  if(v==null || v==='') return '';
+  var t=String(v);
+  if(/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(0,10);
+  var d=new Date(t);
+  if(isNaN(d.getTime())) return '';
+  var mm=('0'+(d.getMonth()+1)).slice(-2), dd=('0'+d.getDate()).slice(-2);
+  return d.getFullYear()+'-'+mm+'-'+dd;
+}
+function amDef(){ return AM_DEFS[amType]; }
+function amTemplate(){ return amDef().cols.map(function(c){ return c.w; }).join(' ')+' 28px'; }
+
+function renderAmend(m){
+  if(state.me.venue==='ALL'){ needVenue(m,'Amend entries'); return; }
+  m.innerHTML=''+
+    '<div class="card"><h2>Amend entries</h2>'+
+      '<div class="sub">Amending for <b>'+esc(venueDisplay(state.me.venue))+'</b> \u2014 only this venue\u2019s '+
+        'entries can be recalled. Recall a processed entry, edit it, and submit: the original rows are '+
+        'replaced and FIFO, stock, consumption and the P&amp;L all re-derive from the archives.<br>'+
+        '<b>Window:</b> a current-month entry can be amended for 20 days from its own date. '+
+        'Last month\u2019s entries close after the 7th of this month. Anything older is locked.</div>'+
+      '<div class="subtabs" id="amTabs"></div>'+
+      '<datalist id="amItemsDL"></datalist>'+
+      '<datalist id="amVendDL"></datalist><datalist id="amBillDL"></datalist>'+
+      '<datalist id="amReqDL"></datalist><datalist id="amDeptDL"></datalist>'+
+      '<div id="amFilters"></div>'+
+      '<div class="msg" id="amMsg"></div>'+
+      '<div id="amBody"></div>'+
+    '</div>';
+  var tw=$('amTabs');
+  AM_TYPES.forEach(function(t){
+    var b=document.createElement('button');
+    b.type='button'; b.textContent=AM_DEFS[t].label;
+    b.className=(t===amType?'active':'');
+    b.onclick=function(){ if(amType===t) return; amType=t; renderAmend($('main')); };
+    tw.appendChild(b);
+  });
+  ensureItems(function(){ amBuildFilters(); });
+}
+
+function amBuildFilters(){
+  var d=amDef();
+  var fh=d.filters.map(function(f){
+    return '<div class="field"><label>'+esc(f.l)+'</label>'+
+           '<input id="amF_'+f.k+'" list="'+f.dl+'" placeholder="Any"></div>';
+  }).join('');
+  $('amFilters').innerHTML=''+
+    '<div class="pbill">'+
+      '<div class="field"><label>Entry date</label>'+
+        '<input type="date" id="amDate" value="'+esc(todayStr())+'"></div>'+
+      fh+
+    '</div>'+
+    '<div class="actions"><button class="btn secondary small" id="amRecall">Recall entries</button></div>';
+  $('amBody').innerHTML='';
+  _amIds=[]; _amLockReasons=[];
+  $('amDate').onchange=amLoadFilterOptions;
+  $('amRecall').onclick=amRecall;
+  amLoadFilterOptions();
+}
+
+/* Filter dropdowns are date-scoped, so they are reloaded whenever the date moves.
+   Failure here is non-fatal: the fields are free text and a blank filter means
+   "any", so a dead dropdown still leaves the tab usable. */
+function amLoadFilterOptions(){
+  var d=amDef(), date=$('amDate') ? $('amDate').value : '';
+  if(!date) return;
+  api('getEditFilterOptions',{type:amType, date:date}).then(function(res){
+    if(!res || !res.ok) return;
+    d.filters.forEach(function(f){
+      var dl=$(f.dl); if(!dl) return;
+      dl.innerHTML=(res[f.src]||[]).map(function(v){ return '<option value="'+esc(v)+'"></option>'; }).join('');
+    });
+  }).catch(function(){});
+}
+
+function amRecall(){
+  var d=amDef(), msg=$('amMsg');
+  var date=$('amDate').value;
+  msg.className='msg'; msg.textContent='';
+  if(!date){ msg.className='msg err'; msg.textContent='Pick the entry date first.'; return; }
+  var payload={ type:amType, date:date };
+  d.filters.forEach(function(f){ var el=$('amF_'+f.k); if(el && el.value.trim()) payload[f.k]=el.value.trim(); });
+  var btn=$('amRecall'); btn.disabled=true;
+  msg.textContent='Recalling\u2026';
+  $('amBody').innerHTML='';
+  api('getProcessedBatch',payload).then(function(res){
+    btn.disabled=false;
+    if(!res.ok){ msg.className='msg err'; msg.textContent=res.error||'Could not recall'; return; }
+    var rows=res.rows||[];
+    if(!rows.length){
+      msg.className='msg err';
+      msg.textContent='Nothing found for that date and filter in '+venueDisplay(state.me.venue)+'.';
+      return;
+    }
+    _amIds=(res.ids||[]).slice();
+    _amLockReasons=[];
+    (res.locked||[]).forEach(function(w){ if(w && _amLockReasons.indexOf(w)<0) _amLockReasons.push(w); });
+    msg.className='msg';
+    msg.textContent=rows.length+' row'+(rows.length===1?'':'s')+' recalled.';
+    amBuildGrid(rows.map(d.fromRecall));
+  }).catch(function(e){
+    btn.disabled=false;
+    msg.className='msg err'; msg.textContent=(e&&e.message)||'Could not recall';
+  });
+}
+
+function amBuildGrid(cells){
+  var d=amDef(), locked=_amLockReasons.length>0;
+  var tpl=amTemplate();
+  var head=d.cols.map(function(c){ return '<span>'+esc(c.l)+'</span>'; }).join('')+'<span></span>';
+  $('amBody').innerHTML=''+
+    (locked ? '<div class="msg err" style="margin-bottom:8px"><b>Locked \u2014 cannot be amended.</b><br>'+
+                esc(_amLockReasons.join(' \u2022 '))+'</div>' : '')+
+    '<div class="amscroll"><div class="amgrid">'+
+      '<div class="amhead" style="grid-template-columns:'+tpl+'">'+head+'</div>'+
+      '<div id="amLines"></div>'+
+    '</div></div>'+
+    '<div class="actions">'+
+      '<button class="btn secondary small" id="amAdd"'+(locked?' disabled':'')+'>+ Add line</button>'+
+    '</div>'+
+    '<div class="actions">'+
+      '<button class="btn small" id="amSubmit"'+(locked?' disabled':'')+'>Apply amendment</button>'+
+      '<button class="btn secondary small" id="amCancel">Discard changes</button>'+
+    '</div>'+
+    '<div class="msg" id="amResult"></div>';
+  cells.forEach(function(c){ amAddLine(c, locked); });
+  $('amAdd').onclick=function(){ amAddLine(amBlankFrom(), false); };
+  $('amCancel').onclick=function(){ amBuildFilters(); };
+  $('amSubmit').onclick=function(){
+    armConfirm($('amSubmit'),
+      'This replaces the recalled rows and re-values every downstream issue for the affected items. Continue?',
+      amSubmit);
+  };
+}
+
+/* A new line inherits the voucher-level fields from the first existing line —
+   date, vendor/bill, department. Retyping them per line is how a second, wrongly
+   dated voucher gets created by accident, because the amend engine groups rows
+   into vouchers by date+dept (issues) or date+bill (purchases). */
+function amBlankFrom(){
+  var d=amDef(), first=document.querySelector('#amLines .amline');
+  var out={};
+  d.cols.forEach(function(c){ out[c.k]=''; });
+  if(first){
+    d.cols.forEach(function(c){
+      if(c.k==='item' || c.k==='qty' || c.k==='notes') return;
+      var el=first.querySelector('[data-k="'+c.k+'"]');
+      if(el) out[c.k]=el.value;
+    });
+  } else if($('amDate')) { out.date=$('amDate').value; }
+  return out;
+}
+
+function amAddLine(c, dead){
+  var d=amDef();
+  var wrap=document.createElement('div');
+  wrap.className='amline'+(dead?' amdead':'');
+  wrap.style.gridTemplateColumns=amTemplate();
+  wrap.innerHTML=d.cols.map(function(col){
+    var listAttr='';
+    if(col.t==='item') listAttr=' list="amItemsDL"';
+    if(col.t==='dept') listAttr=' list="amDeptDL"';
+    var type=(col.t==='date') ? 'date' : 'text';
+    var extra=(col.t==='num') ? ' inputmode="decimal"' : '';
+    return '<input data-k="'+col.k+'" type="'+type+'"'+listAttr+extra+
+           ' placeholder="'+esc(col.l)+'"'+(dead?' disabled':'')+'>';
+  }).join('')+'<button class="amdel" type="button" title="Remove line"'+(dead?' disabled':'')+'>\u00d7</button>';
+  $('amLines').appendChild(wrap);
+  d.cols.forEach(function(col){
+    var el=wrap.querySelector('[data-k="'+col.k+'"]');
+    if(el && c && c[col.k]!=null) el.value=String(c[col.k]);
+  });
+  wrap.querySelector('.amdel').onclick=function(){ if(wrap.parentNode) wrap.parentNode.removeChild(wrap); };
+  return wrap;
+}
+
+function amSubmit(){
+  var d=amDef(), out=$('amResult');
+  out.className='msg'; out.textContent='';
+  if(!_amIds.length){ out.className='msg err'; out.textContent='Nothing was recalled.'; return; }
+  var rows=[], bad=[];
+  Array.prototype.forEach.call(document.querySelectorAll('#amLines .amline'), function(w, idx){
+    var c={};
+    d.cols.forEach(function(col){
+      var el=w.querySelector('[data-k="'+col.k+'"]');
+      c[col.k]=el ? el.value.trim() : '';
+    });
+    var any=d.cols.some(function(col){ return c[col.k]!==''; });
+    if(!any) return;                                   // fully blank line: ignore
+    var miss=d.required.filter(function(k){ return c[k]===''; });
+    if(miss.length){ bad.push('Line '+(idx+1)+': missing '+miss.join(', ')); return; }
+    rows.push(d.toRow(c));
+  });
+  if(bad.length){ out.className='msg err'; out.textContent=bad.join(' \u2022 '); return; }
+  /* Zero rows is a legitimate amendment: it deletes the voucher outright. It is
+     also irreversible from this screen, so it is called out by name rather than
+     slipping through as an empty submit. */
+  var btn=$('amSubmit'); btn.disabled=true;
+  out.textContent=rows.length ? 'Applying\u2026'
+                              : 'Deleting the whole voucher (no lines left)\u2026';
+  /* ids go up verbatim, exactly as recalled — see the note at the top of this
+     section on why they are never rebuilt from the edited fields. */
+  api(d.action,{ ids:_amIds, rows:rows }).then(function(res){
+    btn.disabled=false;
+    if(!res.ok){ out.className='msg err'; out.textContent=res.error||'Amendment failed'; return; }
+    var errs=(res.errors||[]).filter(Boolean);
+    out.className=errs.length?'msg err':'msg';
+    out.innerHTML='Replaced '+(res.deleted||0)+' row'+((res.deleted||0)===1?'':'s')+
+      ' with '+rows.length+'.'+
+      (res.items&&res.items.length ? ' Re-valued: '+esc(res.items.join(', '))+'.' : '')+
+      (errs.length ? '<br><b>Warnings:</b> '+esc(errs.join(' \u2022 ')) : '');
+    _amIds=[];
+    amLoadFilterOptions();
+  }).catch(function(e){
+    btn.disabled=false;
+    out.className='msg err'; out.textContent=(e&&e.message)||'Amendment failed';
+  });
+}
+
 function needVenue(m, title){
   m.innerHTML='<div class="card"><h2>'+esc(title)+'</h2>'+
     '<p class="sub">You\u2019re viewing <b>All venues</b>. Pick one venue in the bar above.</p></div>';
