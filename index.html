@@ -1652,8 +1652,7 @@ function acCloseAll(){
    Deliberately ABSENT: rpItemList and rpCatList (report filters, where a partial
    string is the whole point), vendors, and departments. Sales needs nothing —
    its item field is readonly with a fixed value. */
-var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1, retItemsDL:1,
-                        amItemsDL:1 };
+var AC_STRICT_LISTS = { itemsDL:1, itemsDL2:1, poItemsDL:1, rqItemsDL:1, retItemsDL:1 };
 
 function acUpgrade(){
   Array.prototype.forEach.call(document.querySelectorAll('input[list]'), function(inp){
@@ -4688,8 +4687,8 @@ var AM_TYPES = ['purchase', 'issue', 'return'];
 var AM_DEFS = {
   purchase: {
     label: 'Purchase', action: 'amendPurchases', idLabel: 'PR_ID',
-    filters: [{ k:'vendor', l:'Vendor', dl:'amVendDL', src:'vendors' },
-              { k:'bill',   l:'Bill no', dl:'amBillDL', src:'bills' }],
+    filters: [{ k:'vendor', l:'Vendor', src:'vendors' },
+              { k:'bill',   l:'Bill no', src:'bills' }],
     cols: [{ k:'date',   l:'Date',   t:'date', w:'140px' },
            { k:'item',   l:'Item',   t:'item', w:'minmax(160px,1.4fr)' },
            { k:'qty',    l:'Qty',    t:'num',  w:'80px' },
@@ -4704,7 +4703,7 @@ var AM_DEFS = {
   },
   issue: {
     label: 'Issue', action: 'amendIssues', idLabel: 'IS_ID',
-    filters: [{ k:'reqSr', l:'Req Sr', dl:'amReqDL', src:'reqSrs' }],
+    filters: [{ k:'reqSr', l:'Req Sr', src:'reqSrs' }],
     cols: [{ k:'date',  l:'Date',   t:'date', w:'140px' },
            { k:'reqSr', l:'Req Sr', t:'text', w:'100px' },
            { k:'item',  l:'Item',   t:'item', w:'minmax(160px,1.4fr)' },
@@ -4720,7 +4719,7 @@ var AM_DEFS = {
   },
   'return': {
     label: 'Return / closing count', action: 'amendReturns', idLabel: 'RT_ID',
-    filters: [{ k:'dept', l:'Department', dl:'amDeptDL', src:'depts' }],
+    filters: [{ k:'dept', l:'Department', src:'depts' }],
     cols: [{ k:'date',  l:'Count date', t:'date', w:'140px' },
            { k:'dept',  l:'Dept',  t:'dept', w:'minmax(120px,1fr)' },
            { k:'item',  l:'Item',  t:'item', w:'minmax(160px,1.4fr)' },
@@ -4733,6 +4732,30 @@ var AM_DEFS = {
 };
 var amType = 'purchase';
 var _amIds = [], _amLockReasons = [];
+
+/* Autocomplete on this tab is wired by calling acAttach DIRECTLY, and no field
+ * carries a `list=` attribute. That is deliberate: acUpgrade() walks
+ * input[list], and if the referenced datalist is EMPTY at the moment it runs it
+ * substitutes a provider that returns ITEM NAMES. It then sets _acDone, so the
+ * substitution is permanent — the Vendor box offered "Tomato Ketchup (Heinz
+ * 450gm)" and repopulating the datalist afterwards could never undo it.
+ *
+ * Empty-at-upgrade is unavoidable here, not an accident of ordering: the
+ * vendor / bill / req-sr / dept lists are DATE-SCOPED, so they are fetched after
+ * the inputs already exist and are refetched every time the date changes.
+ * acUpgrade also snapshots a static array, so even a well-timed fill would go
+ * stale on the next date change.
+ *
+ * Providers are therefore live closures over _amOpts, read on each keystroke,
+ * and acUpgrade skips these inputs entirely because none of them has `list`. */
+var _amOpts = { vendors: [], bills: [], reqSrs: [], depts: [] };
+
+function amItemNames(){ return (_itemsCache && _itemsCache.items || []).map(function(x){ return x.name; }); }
+function amDeptNames(){
+  var d = (_itemsCache && _itemsCache.departments) || [];
+  return (d.length ? d : _amOpts.depts) || [];
+}
+function amOptProvider(key){ return function(){ return _amOpts[key] || []; }; }
 
 /* Apps Script serialises a Date to a UTC ISO string. Every date this system
    stores is anchored to NOON in the spreadsheet timezone, so the UTC instant is
@@ -4762,9 +4785,6 @@ function renderAmend(m){
         '<b>Window:</b> a current-month entry can be amended for 20 days from its own date. '+
         'Last month\u2019s entries close after the 7th of this month. Anything older is locked.</div>'+
       '<div class="subtabs" id="amTabs"></div>'+
-      '<datalist id="amItemsDL"></datalist>'+
-      '<datalist id="amVendDL"></datalist><datalist id="amBillDL"></datalist>'+
-      '<datalist id="amReqDL"></datalist><datalist id="amDeptDL"></datalist>'+
       '<div id="amFilters"></div>'+
       '<div class="msg" id="amMsg"></div>'+
       '<div id="amBody"></div>'+
@@ -4784,7 +4804,7 @@ function amBuildFilters(){
   var d=amDef();
   var fh=d.filters.map(function(f){
     return '<div class="field"><label>'+esc(f.l)+'</label>'+
-           '<input id="amF_'+f.k+'" list="'+f.dl+'" placeholder="Any"></div>';
+           '<input id="amF_'+f.k+'" placeholder="Any"></div>';
   }).join('');
   $('amFilters').innerHTML=''+
     '<div class="pbill">'+
@@ -4797,6 +4817,13 @@ function amBuildFilters(){
   _amIds=[]; _amLockReasons=[];
   $('amDate').onchange=amLoadFilterOptions;
   $('amRecall').onclick=amRecall;
+  /* Not strict: a blank filter means "any", and these are free-text narrowing
+     fields, so a value that happens not to be in the fetched list must still be
+     typeable. Matches how the dept field behaves on the entry tabs. */
+  d.filters.forEach(function(f){
+    var el=$('amF_'+f.k);
+    if(el) acAttach(el, f.k==='dept' ? amDeptNames : amOptProvider(f.src), false);
+  });
   amLoadFilterOptions();
 }
 
@@ -4808,10 +4835,7 @@ function amLoadFilterOptions(){
   if(!date) return;
   api('getEditFilterOptions',{type:amType, date:date}).then(function(res){
     if(!res || !res.ok) return;
-    d.filters.forEach(function(f){
-      var dl=$(f.dl); if(!dl) return;
-      dl.innerHTML=(res[f.src]||[]).map(function(v){ return '<option value="'+esc(v)+'"></option>'; }).join('');
-    });
+    d.filters.forEach(function(f){ _amOpts[f.src]=(res[f.src]||[]).slice(); });
   }).catch(function(){});
 }
 
@@ -4899,18 +4923,22 @@ function amAddLine(c, dead){
   wrap.className='amline'+(dead?' amdead':'');
   wrap.style.gridTemplateColumns=amTemplate();
   wrap.innerHTML=d.cols.map(function(col){
-    var listAttr='';
-    if(col.t==='item') listAttr=' list="amItemsDL"';
-    if(col.t==='dept') listAttr=' list="amDeptDL"';
     var type=(col.t==='date') ? 'date' : 'text';
     var extra=(col.t==='num') ? ' inputmode="decimal"' : '';
-    return '<input data-k="'+col.k+'" type="'+type+'"'+listAttr+extra+
+    return '<input data-k="'+col.k+'" type="'+type+'"'+extra+
            ' placeholder="'+esc(col.l)+'"'+(dead?' disabled':'')+'>';
   }).join('')+'<button class="amdel" type="button" title="Remove line"'+(dead?' disabled':'')+'>\u00d7</button>';
   $('amLines').appendChild(wrap);
   d.cols.forEach(function(col){
     var el=wrap.querySelector('[data-k="'+col.k+'"]');
-    if(el && c && c[col.k]!=null) el.value=String(c[col.k]);
+    if(!el) return;
+    if(c && c[col.k]!=null) el.value=String(c[col.k]);
+    /* Only item and dept get a list. Date, Qty, Rate, Vendor, Bill no, Req Sr,
+       Issued/Received by and Notes get NOTHING — an autocomplete on a free-text
+       or numeric field is what produced item names in Vendor. Item is strict
+       (it must resolve to the master, as on the entry tabs); dept is not. */
+    if(col.t==='item') acAttach(el, amItemNames, true);
+    else if(col.t==='dept') acAttach(el, amDeptNames, false);
   });
   wrap.querySelector('.amdel').onclick=function(){ if(wrap.parentNode) wrap.parentNode.removeChild(wrap); };
   return wrap;
