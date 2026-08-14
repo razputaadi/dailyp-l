@@ -35,6 +35,6 @@
      orientation, the export unclipping fix, the UOM line on the entry forms — so
      without this bump an installed phone would keep serving the July front end
      against an August backend, which is the worst of both. */
-  g.GYV_BUILD = '2026-08-14-01';
+  g.GYV_BUILD = '2026-08-14-02';
 
 })(typeof self !== 'undefined' ? self : this);
